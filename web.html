@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>PipeWire EQ</title>
+<style>
+:root { color-scheme: light dark; font-family: system-ui,sans-serif; accent-color: #277bce; }
+body { max-width: 860px; margin: 3rem auto; padding: 0 1.2rem; line-height: 1.5; }
+h1 { margin-bottom: .2rem; font-size: 1.8rem; }
+p { margin: .5rem 0 1.2rem; }
+fieldset { border: 1px solid #8886; border-radius: 8px; padding: 1rem; margin: 1rem 0; }
+legend { font-weight: 600; }
+#editor { min-width: 0; }
+#bands { display: grid; grid-template-columns: repeat(10, minmax(4rem, 1fr)); gap: .6rem; overflow-x: auto; padding: .5rem .3rem 1rem; }
+.band { display: flex; flex-direction: column; align-items: center; gap: .6rem; white-space: nowrap; }
+.band label { font-size: .85rem; }
+input[type=range] { width: 100%; min-height: 32px; margin: 0; }
+input[type=number] { width: 5rem; padding: .3rem; box-sizing: border-box; font: inherit; }
+.band input[type=range] { writing-mode: vertical-lr; direction: rtl; width: 32px; height: 240px; }
+.band input[type=number] { width: 4rem; }
+.preamp { display: grid; grid-template-columns: 5rem 1fr 6rem; gap: 1rem; align-items: center; margin: .55rem 0; }
+button, select { font: inherit; padding: .5rem .7rem; max-width: 100%; }
+button { cursor: pointer; } button:disabled { cursor: default; }
+.actions { display: flex; flex-wrap: wrap; align-items: center; gap: .6rem; }
+#output { flex: 1; min-width: 180px; }
+#errors { color: light-dark(#a51b16,#ffa7a0); white-space: pre-line; }
+.muted { opacity: .75; font-size: .9rem; }
+:focus-visible { outline: 3px solid #277bce; outline-offset: 3px; }
+@media (max-width: 480px) { body { margin-top: 1rem; } .preamp { gap: .4rem; grid-template-columns: 3.5rem 1fr 5.3rem; } }
+</style>
+<h1>PipeWire EQ</h1>
+<p>Ten bands · stereo · Q 1.4</p>
+<p id="status" role="status" aria-live="polite">Connecting to editor…</p>
+<p id="errors" role="alert"></p>
+<fieldset>
+ <legend>Output</legend>
+ <div class="actions"><label for="output">Physical output</label><select id="output" disabled><option>Loading…</option></select></div>
+ <p class="muted">The EQ sends audio only to this output.</p>
+ <button id="default" disabled>Use EQ as default</button>
+ <p class="muted">Existing application streams stay under your system mixer’s control.</p>
+</fieldset>
+<fieldset id="editor" disabled>
+ <legend>Equalizer</legend>
+ <div id="bands"></div>
+ <div class="preamp"><label for="preamp">Preamp</label><input id="preamp" type="range" min="-24" max="0" step="0.1" value="0" aria-label="Preamp gain in dB"><input id="preamp-value" type="number" min="-24" max="0" step="0.1" value="0" aria-label="Preamp gain in dB, numeric"></div>
+ <p class="muted">Gains are in dB. Lower the preamp when boosting bands to leave headroom.</p>
+ <button id="reset">Reset to flat</button>
+</fieldset>
+<p id="saved" role="status" class="muted"></p>
+<p class="muted">Changes save automatically. The saved EQ keeps working when this editor closes.</p>
+<script src="/app.js" defer></script>
+</html>

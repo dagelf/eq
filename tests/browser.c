@@ -1,0 +1,105 @@
+/* Chromium DevTools pipe driver; no frontend test runtime or downloaded packages. */
+#define _GNU_SOURCE
+#include <errno.h>
+#include <fcntl.h>
+#include <json-c/json.h>
+#include <poll.h>
+#include <signal.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/wait.h>
+#include <unistd.h>
+static int input,output,serial;
+static pid_t browser;
+static char *session;
+static void cleanup(void) { if (browser>0) { kill(browser,SIGTERM); waitpid(browser,NULL,0); } }
+static void fail(const char *why) { fprintf(stderr,"Browser test: %s\n",why); exit(1); }
+static struct json_object *command(const char *method,struct json_object *params) {
+    fprintf(stderr,"CDP %s\n",method);
+    struct json_object *o=json_object_new_object(); int id=++serial;
+    json_object_object_add(o,"id",json_object_new_int(id));
+    json_object_object_add(o,"method",json_object_new_string(method));
+    json_object_object_add(o,"params",params?params:json_object_new_object());
+    if (session) json_object_object_add(o,"sessionId",json_object_new_string(session));
+    const char *s=json_object_to_json_string(o); size_t len=strlen(s)+1,off=0;
+    while (off<len) { ssize_t n=write(input,s+off,len-off); if (n<=0) fail("Cannot write command"); off+=n; }
+    json_object_put(o);
+    for (;;) {
+        size_t size=0,cap=4096; char *buf=malloc(cap);
+        for (;;) {
+            struct pollfd p={.fd=output,.events=POLLIN};
+            if (poll(&p,1,15000)<=0) fail("Timed out waiting for Chromium");
+            char ch; if (read(output,&ch,1)!=1) fail("Chromium closed the pipe");
+            if (size+1>=cap) { cap*=2; buf=realloc(buf,cap); if (!buf || cap>16000000) fail("Response too large"); }
+            buf[size++]=ch; if (!ch) break;
+        }
+        o=json_tokener_parse(buf); free(buf);
+        struct json_object *response_id,*error;
+        if (o && json_object_object_get_ex(o,"id",&response_id) && json_object_get_int(response_id)==id) {
+            if (json_object_object_get_ex(o,"error",&error)) fail(json_object_to_json_string(error));
+            return o;
+        }
+        if (o) json_object_put(o);
+    }
+}
+static void evaluate(const char *expression) {
+    struct json_object *p=json_object_new_object();
+    json_object_object_add(p,"expression",json_object_new_string(expression));
+    json_object_object_add(p,"awaitPromise",json_object_new_boolean(1));
+    json_object_object_add(p,"returnByValue",json_object_new_boolean(1));
+    struct json_object *o=command("Runtime.evaluate",p),*result,*error;
+    json_object_object_get_ex(o,"result",&result);
+    if (json_object_object_get_ex(result,"exceptionDetails",&error)) fail(json_object_to_json_string(error));
+    json_object_put(o);
+}
+static void key(const char *name,int code) {
+    const char *types[]={"keyDown","keyUp"};
+    for (int i=0;i<2;i++) {
+        struct json_object *p=json_object_new_object();
+        json_object_object_add(p,"type",json_object_new_string(types[i]));
+        json_object_object_add(p,"key",json_object_new_string(name));
+        json_object_object_add(p,"code",json_object_new_string(name));
+        json_object_object_add(p,"windowsVirtualKeyCode",json_object_new_int(code));
+        if (code==13 && i==0) json_object_object_add(p,"text",json_object_new_string("\r"));
+        json_object_put(command("Input.dispatchKeyEvent",p));
+    }
+}
+int main(int argc,char **argv) {
+    if (argc!=2) return 2;
+    int to[2],from[2]; if (pipe2(to,O_CLOEXEC) || pipe2(from,O_CLOEXEC)) return 1;
+    browser=fork();
+    if (browser==0) {
+        int a=fcntl(to[0],F_DUPFD,10),b=fcntl(from[1],F_DUPFD,10);
+        dup2(a,3); dup2(b,4); close(a); close(b);
+        setenv("DBUS_SESSION_BUS_ADDRESS","unix:path=/dev/null",1);
+        char profile[1024]; snprintf(profile,sizeof(profile),"--user-data-dir=%s/chromium",argv[1]);
+        const char *binary=getenv("CHROMIUM_BINARY");
+        if (!binary) binary=access("/usr/lib/chromium/chromium",X_OK)==0?"/usr/lib/chromium/chromium":"chromium";
+        execlp(binary,binary,"--headless","--disable-gpu","--disable-background-networking","--no-proxy-server","--password-store=basic","--no-first-run","--remote-debugging-pipe",profile,NULL); _exit(127);
+    }
+    if (browser<0) return 1;
+    atexit(cleanup); close(to[0]); close(from[1]); input=to[1]; output=from[0];
+    struct json_object *o=command("Target.createTarget",json_tokener_parse("{\"url\":\"about:blank\"}")),*result,*target;
+    json_object_object_get_ex(o,"result",&result); json_object_object_get_ex(result,"targetId",&target);
+    struct json_object *p=json_object_new_object();
+    json_object_object_add(p,"targetId",json_object_get(target)); json_object_object_add(p,"flatten",json_object_new_boolean(1)); json_object_put(o);
+    o=command("Target.attachToTarget",p); json_object_object_get_ex(o,"result",&result); json_object_object_get_ex(result,"sessionId",&target); session=strdup(json_object_get_string(target)); json_object_put(o);
+    json_object_put(command("Page.navigate",json_tokener_parse("{\"url\":\"http://127.0.0.1:8932\"}")));
+    usleep(300000);
+    evaluate("(async()=>{window.check=(v,m)=>{if(!v)throw Error(m)};window.waitFor=async(f)=>{for(let i=0;i<100;i++){if(await f())return;await new Promise(r=>setTimeout(r,50));}throw Error('condition timed out')};await waitFor(()=>document.querySelectorAll('#bands input[type=range]').length===10&&!document.querySelector('#editor').disabled);check(document.querySelectorAll('input[aria-label]').length===22,'gain labels');document.querySelector('#band-0').focus()})()");
+    key("ArrowUp",38);
+    evaluate("(async()=>{await waitFor(async()=>{const s=await(await fetch('/api/state')).json();return s.settings.gains[0]===0.1&&!s.pending});document.querySelector('#reset').focus()})()");
+    key("Enter",13);
+    evaluate("(async()=>{await waitFor(async()=>{const s=await(await fetch('/api/state')).json();return s.settings.gains.every(v=>v===0)&&s.settings.preamp===0&&!s.pending});const o=document.querySelector('#output');o.value='test.other';o.dispatchEvent(new Event('change',{bubbles:true}));await waitFor(async()=>{const s=await(await fetch('/api/state')).json();return s.settings.output==='test.other'&&s.live.connected&&!s.pending});await waitFor(()=>!document.querySelector('#default').disabled);document.querySelector('#default').focus()})()");
+    key("Enter",13);
+    evaluate("(async()=>{await waitFor(async()=> (await(await fetch('/api/state')).json()).live.default);await waitFor(()=>document.querySelector('#default').textContent==='EQ is the default sink');check(document.querySelector('#errors').textContent==='','UI errors')})()");
+    json_object_put(command("Emulation.setDeviceMetricsOverride",json_tokener_parse("{\"width\":390,\"height\":844,\"deviceScaleFactor\":1,\"mobile\":true}")));
+    evaluate("check(document.documentElement.scrollWidth<=innerWidth,'mobile horizontal overflow')");
+    json_object_put(command("Emulation.setDeviceMetricsOverride",json_tokener_parse("{\"width\":1000,\"height\":1250,\"deviceScaleFactor\":1,\"mobile\":false}")));
+    evaluate("window.scrollTo(0,0)");
+    o=command("Page.captureScreenshot",json_tokener_parse("{\"format\":\"png\"}")); json_object_object_get_ex(o,"result",&result); json_object_object_get_ex(result,"data",&target);
+    char path[1024]; snprintf(path,sizeof(path),"%s/browser.png.base64",argv[1]); FILE *f=fopen(path,"w"); if (!f) return 1; fputs(json_object_get_string(target),f); fclose(f); json_object_put(o);
+    puts("Browser: labelled controls, keyboard slider, keyboard reset, output selection and keyboard default sink passed.");
+    return 0;
+}
