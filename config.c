@@ -18,10 +18,43 @@ bool valid_name(const char *s) {
         if (!isalnum(*p) && !strchr("._:-",*p)) return false;
     return true;
 }
+/* BlueZ has used both MAC separators and endpoint suffixes in output names.
+ * Compare the device address, never a human-readable (non-unique) label. */
+static bool bluetooth_address(const char *name,char address[18]) {
+    const char *prefix="bluez_output.";
+    if (!valid_name(name) || strncmp(name,prefix,strlen(prefix))) return false;
+    const char *p=name+strlen(prefix);
+    if (strlen(p)<17 || (p[17] && p[17]!='.')) return false;
+    for (int i=0;i<17;i++) {
+        if (i%3==2) {
+            if (p[i]!=':' && p[i]!='_') return false;
+            address[i]=':';
+        } else {
+            if (!isxdigit((unsigned char)p[i])) return false;
+            address[i]=tolower((unsigned char)p[i]);
+        }
+    }
+    address[17]=0; return true;
+}
+bool same_bluetooth_output(const char *a,const char *b) {
+    char x[18],y[18];
+    return bluetooth_address(a,x) && bluetooth_address(b,y) && !strcmp(x,y);
+}
 static bool number(struct json_object *o, double lo, double hi, double *v) {
     if (!o || !(json_object_is_type(o,json_type_int) || json_object_is_type(o,json_type_double))) return false;
     *v=json_object_get_double(o);
     return isfinite(*v) && *v>=lo && *v<=hi;
+}
+double average_gain(const struct settings *s) {
+    double sum=0; for (int i=0;i<BANDS;i++) sum+=s->gains[i]; return sum/BANDS;
+}
+void compensate(struct settings *s) {
+    if (s->maintain) s->preamp=fmax(-24,fmin(12,s->loudness_target-average_gain(s)));
+}
+bool eq_same(const struct settings *a, const struct settings *b) {
+    if (fabs(a->preamp-b->preamp)>0.05) return false;
+    for (int i=0;i<BANDS;i++) if (fabs(a->gains[i]-b->gains[i])>0.05) return false;
+    return true;
 }
 bool parse_eq(struct json_object *o, struct settings *s) {
     struct json_object *g,*p;
@@ -29,8 +62,17 @@ bool parse_eq(struct json_object *o, struct settings *s) {
     if (!json_object_is_type(o,json_type_object) ||
         !json_object_object_get_ex(o,"gains",&g) || !json_object_is_type(g,json_type_array) ||
         json_object_array_length(g)!=BANDS || !json_object_object_get_ex(o,"preamp",&p) ||
-        !number(p,-24,0,&n.preamp)) return false;
+        !number(p,-24,12,&n.preamp)) return false;
     for (int i=0;i<BANDS;i++) if (!number(json_object_array_get_idx(g,i),-12,12,&n.gains[i])) return false;
+    struct json_object *v;
+    if (json_object_object_get_ex(o,"maintain",&v)) {
+        if (!json_object_is_type(v,json_type_boolean)) return false;
+        n.maintain=json_object_get_boolean(v);
+    }
+    if (json_object_object_get_ex(o,"loudness_target",&v)) {
+        if (!number(v,-36,24,&n.loudness_target)) return false;
+    } else n.loudness_target=average_gain(&n)+n.preamp;
+    compensate(&n);
     *s=n;
     return true;
 }
@@ -39,6 +81,8 @@ struct json_object *settings_json(const struct settings *s) {
     for (int i=0;i<BANDS;i++) json_object_array_add(g,json_object_new_double(s->gains[i]));
     json_object_object_add(o,"gains",g);
     json_object_object_add(o,"preamp",json_object_new_double(s->preamp));
+    json_object_object_add(o,"maintain",json_object_new_boolean(s->maintain));
+    json_object_object_add(o,"loudness_target",json_object_new_double(s->loudness_target));
     json_object_object_add(o,"output",json_object_new_string(s->output));
     json_object_object_add(o,"version",json_object_new_int(1));
     return o;

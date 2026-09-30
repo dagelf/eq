@@ -1,5 +1,7 @@
 #define _GNU_SOURCE
 #include "eq.h"
+#include "desktop.h"
+#include "library.h"
 #include <arpa/inet.h>
 #include <ctype.h>
 #include <errno.h>
@@ -25,7 +27,8 @@
 #include "build/web.h"
 #include "build/js.h"
 
-#define ORIGIN "http://127.0.0.1:8932"
+static char origin_url[64]="http://127.0.0.1:8932", host_name[32]="127.0.0.1:8932";
+static unsigned listen_port=8932;
 #define BODY_LIMIT 4096
 struct object {
     struct object *next;
@@ -34,7 +37,7 @@ struct object {
     struct pw_properties *props;
     struct spa_hook listener;
     char name[NAME_SIZE], description[NAME_SIZE];
-    bool physical, sink, playback, graph;
+    bool physical, sink, playback, graph, route_checked;
     enum pw_node_state node_state;
     enum pw_link_state link_state;
 };
@@ -60,6 +63,9 @@ struct app {
     char instance[64];
     pthread_mutex_t mutex;
     struct json_object *snapshot;
+    struct json_object *desktop;
+    struct library library;
+    double next_desktop;
 };
 static struct app app={.mutex=PTHREAD_MUTEX_INITIALIZER};
 static double now(void) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts); return ts.tv_sec+ts.tv_nsec/1e9; }
@@ -73,7 +79,47 @@ static struct object *find_name(const char *name) {
     for (struct object *o=app.objects;o;o=o->next) if (!strcmp(o->name,name)) return o;
     return NULL;
 }
-static bool eq_same(const struct settings *a,const struct settings *b) {
+static bool capture_node(uint32_t id) {
+    for (struct object *o=app.objects;o;o=o->next)
+        if (o->id==id && o->props)
+            return !strcmp(prop(&o->props->dict,PW_KEY_MEDIA_CLASS),"Stream/Input/Audio");
+    return false;
+}
+static void recover_output(void) {
+    struct object *current=find_name(app.desired.output),*replacement=NULL;
+    if (!app.installed || (current && current->physical)) return;
+    for (struct object *o=app.objects;o;o=o->next) {
+        if (!o->physical || !same_bluetooth_output(app.desired.output,o->name)) continue;
+        if (replacement) return; /* Multiple endpoints: let the user choose. */
+        replacement=o;
+    }
+    if (!replacement) return;
+    snprintf(app.desired.output,sizeof(app.desired.output),"%s",replacement->name);
+    app.output_pending=true; app.persist_pending=true; app.changed_at=now(); app.revision++;
+}
+static void route_playback(void) {
+    if (!app.editing || !app.metadata || strcmp(app.default_name,SINK_NAME)) return;
+    struct object *output=find_name(app.desired.output);
+    if (!output || !output->physical) return;
+    for (struct object *stream=app.objects;stream;stream=stream->next) {
+        if (!stream->props || stream->route_checked || stream->playback) continue;
+        const struct spa_dict *props=&stream->props->dict;
+        if (strcmp(prop(props,PW_KEY_MEDIA_CLASS),"Stream/Output/Audio") ||
+            !strcmp(prop(props,"node.virtual"),"true") || *prop(props,"node.link-group")) continue;
+        bool linked=false,other=false;
+        for (struct object *link=app.objects;link;link=link->next) {
+            if (*link->name || link->out_node!=stream->id ||
+                (link->link_state!=PW_LINK_STATE_PAUSED && link->link_state!=PW_LINK_STATE_ACTIVE)) continue;
+            linked=true;
+            if (link->in_node!=output->id) other=true;
+        }
+        if (!linked) continue;
+        /* Once per stream/default selection. Later manual moves are respected. */
+        if (other || pw_metadata_set_property(app.metadata,stream->id,"target.object","Spa:String",SINK_NAME)>=0)
+            stream->route_checked=true;
+    }
+}
+static bool readback_same(const struct settings *a,const struct settings *b) {
     if (fabs(a->preamp-b->preamp)>0.002) return false;
     for (int i=0;i<BANDS;i++) if (fabs(a->gains[i]-b->gains[i])>0.002) return false;
     return true;
@@ -116,7 +162,7 @@ static void node_param(void *data,int seq,uint32_t id,uint32_t index,uint32_t ne
     }
     if (mask==((1u<<(BANDS+1))-1)) {
         app.actual=actual; app.readback=true;
-        if (eq_same(&actual,&app.sent)) {
+        if (readback_same(&actual,&app.sent)) {
             app.applied_revision=app.sent_revision; app.apply_deadline=0; app.awaiting_readback=false; app.apply_error[0]=0;
         }
     }
@@ -130,10 +176,13 @@ static const struct pw_link_events link_events={PW_VERSION_LINK_EVENTS,.info=lin
 static int metadata_property(void *data,uint32_t subject,const char *key,const char *type,const char *value) {
     (void)data; (void)type;
     if (subject==PW_ID_CORE && (!key || !strcmp(key,"default.audio.sink"))) {
+        bool was_default=!strcmp(app.default_name,SINK_NAME);
         app.default_name[0]=0;
         struct json_object *o=value?json_tokener_parse(value):NULL,*name;
         if (o && json_object_object_get_ex(o,"name",&name)) snprintf(app.default_name,sizeof(app.default_name),"%s",json_object_get_string(name));
         if (!strcmp(app.default_name,SINK_NAME)) { app.default_deadline=0; app.default_error[0]=0; }
+        if (!was_default && !strcmp(app.default_name,SINK_NAME))
+            for (struct object *n=app.objects;n;n=n->next) n->route_checked=false;
         if (o) json_object_put(o);
     }
     return 0;
@@ -248,6 +297,8 @@ static void snapshot(void) {
     struct object *sink=find_name(SINK_NAME),*play=find_name(PLAY_NAME),*output=find_name(app.desired.output);
     unsigned links=0; uint32_t first_port=SPA_ID_INVALID; bool wrong=false,link_error=false;
     for (struct object *o=app.objects;o;o=o->next) if (play && o->out_node==play->id && !*o->name) {
+        /* Recording and volume-meter taps do not change the playback route. */
+        if (capture_node(o->in_node)) continue;
         if (o->link_state==PW_LINK_STATE_ERROR) link_error=true;
         if (o->link_state!=PW_LINK_STATE_PAUSED && o->link_state!=PW_LINK_STATE_ACTIVE) continue;
         if (output && o->in_node==output->id) { if (!links) { first_port=o->out_port; links=1; } else if (o->out_port!=first_port) links=2; }
@@ -259,6 +310,9 @@ static void snapshot(void) {
     struct json_object *o=json_object_new_object(),*live=json_object_new_object(),*outputs=json_object_new_array(),*freq=json_object_new_array();
     add_string(o,"instance",app.instance);
     json_object_object_add(o,"settings",settings_json(&app.desired));
+    json_object_object_add(o,"average_gain",json_object_new_double(average_gain(&app.desired)));
+    json_object_object_add(o,"desktop",app.desktop?json_object_get(app.desktop):json_object_new_object());
+    json_object_object_add(o,"library",library_snapshot(&app.library));
     json_object_object_add(o,"saved",settings_json(&app.saved));
     for (int i=0;i<BANDS;i++) json_object_array_add(freq,json_object_new_int(frequencies[i]));
     json_object_object_add(o,"frequencies",freq);
@@ -275,7 +329,9 @@ static void snapshot(void) {
     json_object_object_add(live,"stereo_links",json_object_new_int(links));
     if (sink) json_object_object_add(live,"sink_id",json_object_new_int64(sink->id));
     if (app.readback) json_object_object_add(live,"eq",settings_json(&app.actual));
-    add_string(live,"status",!app.pw_connected?"PipeWire disconnected; reconnecting":!app.installed?"Setup required":!sink || !sink->graph?"Restart PipeWire once to load the new EQ graph":sink->node_state==PW_NODE_STATE_ERROR?"EQ sink is in an error state":!app.readback?"Waiting for EQ parameter readback":!output?"Selected output is unavailable":wrong?"EQ is linked to another output":link_error?"Output link failed":links<2?"Waiting for stereo output links (WirePlumber required)":"Connected");
+    bool output_missing=!output || !output->physical;
+    if (output_missing) { app.output_error[0]=0; app.output_deadline=0; }
+    add_string(live,"status",!app.pw_connected?"PipeWire disconnected; reconnecting":!app.installed?"Setup required":!sink || !sink->graph?"Restart PipeWire once to load the new EQ graph":sink->node_state==PW_NODE_STATE_ERROR?"EQ is in an error state":!app.readback?"Waiting for EQ parameter readback":output_missing?"EQ output is unavailable. Select your speakers or headphones under Output below; no audio restart is needed. EQ editing is disabled until it reconnects.":wrong?"EQ is connected to a different output. Select the desired device under Output below.":link_error?"EQ could not connect to the selected output. Select an available device under Output below.":links<2?"EQ is not connected to the selected output for both audio channels. Select an available device under Output below; EQ editing is disabled until it reconnects.":"Connected");
     json_object_object_add(o,"live",live);
     add_bool(o,"setup_required",!app.installed);
     add_bool(o,"pending",app.persist_pending || app.eq_pending || app.output_pending || app.default_pending || app.apply_deadline>0 || app.default_deadline>0 || app.output_deadline>0);
@@ -291,6 +347,15 @@ static void tick(void *data,uint64_t expirations) {
     double t=now();
     if (app.broken) disconnect_pw();
     if (!app.core && t>=app.next_connect) connect_pw();
+    recover_output();
+    if (t>=app.next_desktop) {
+        if (app.desktop) json_object_put(app.desktop);
+        app.desktop=desktop_snapshot();
+        if (library_follow(&app.library,app.desktop,&app.desired,app.editing)) {
+            app.revision++; app.changed_at=t; app.persist_pending=true; app.eq_pending=true;
+        }
+        library_save(&app.library); app.next_desktop=t+.5;
+    }
     struct object *sink=find_name(SINK_NAME),*play=find_name(PLAY_NAME);
     if ((app.need_apply || app.eq_pending) && sink && sink->graph && sink->proxy) apply_eq(sink);
     if ((app.need_route || app.output_pending) && play && app.metadata) {
@@ -310,7 +375,7 @@ static void tick(void *data,uint64_t expirations) {
         snprintf(app.apply_error,sizeof(app.apply_error),"EQ parameter readback did not confirm the requested settings"); app.apply_deadline=0;
     }
     if (app.output_deadline>0 && t>app.output_deadline) {
-        snprintf(app.output_error,sizeof(app.output_error),"WirePlumber has not connected the selected stereo output"); app.output_deadline=0;
+        snprintf(app.output_error,sizeof(app.output_error),"EQ output connection did not complete. Select an available device under Output below; no audio restart is needed."); app.output_deadline=0;
     }
     if (app.default_deadline>0 && t>app.default_deadline) {
         snprintf(app.default_error,sizeof(app.default_error),"WirePlumber did not confirm EQ as the default sink"); app.default_deadline=0;
@@ -320,7 +385,9 @@ static void tick(void *data,uint64_t expirations) {
         if (!app.core || t>app.stop_deadline) pw_main_loop_quit(app.loop);
         else if (!app.stop_seq) app.stop_seq=pw_core_sync(app.core,PW_ID_CORE,0);
     }
-    snapshot(); pthread_mutex_unlock(&app.mutex);
+    snapshot();
+    if (!app.stopping) route_playback();
+    pthread_mutex_unlock(&app.mutex);
 }
 struct request { size_t len; bool oversized; char body[BODY_LIMIT+1]; };
 static enum MHD_Result reply(struct MHD_Connection *c,unsigned code,const char *body,const char *type) {
@@ -353,7 +420,7 @@ static enum MHD_Result handle(void *cls,struct MHD_Connection *c,const char *url
         *size=0; return MHD_YES;
     }
     const char *host=MHD_lookup_connection_value(c,MHD_HEADER_KIND,"Host");
-    if (!host || strcmp(host,"127.0.0.1:8932")) return error_reply(c,403,"Use http://127.0.0.1:8932");
+    if (!host || strcmp(host,host_name)) return error_reply(c,403,origin_url);
     if (r->oversized) return error_reply(c,413,"Request exceeds 4096 bytes");
     if (!strcmp(method,"GET")) {
         if (!strcmp(url,"/")) return reply(c,200,(char *)web_html,"text/html; charset=utf-8");
@@ -366,10 +433,11 @@ static enum MHD_Result handle(void *cls,struct MHD_Connection *c,const char *url
         pthread_mutex_unlock(&app.mutex); return result;
     }
     const char *origin=MHD_lookup_connection_value(c,MHD_HEADER_KIND,"Origin"),*site=MHD_lookup_connection_value(c,MHD_HEADER_KIND,"Sec-Fetch-Site");
-    if ((origin && strcmp(origin,ORIGIN)) || (site && strcmp(site,"same-origin") && strcmp(site,"none"))) return error_reply(c,403,"Cross-origin mutations are forbidden");
+    if ((origin && strcmp(origin,origin_url)) || (site && strcmp(site,"same-origin") && strcmp(site,"none"))) return error_reply(c,403,"Cross-origin mutations are forbidden");
     bool eq=!strcmp(url,"/api/eq"),output=!strcmp(url,"/api/output"),def=!strcmp(url,"/api/default");
-    if (!eq && !output && !def) return error_reply(c,404,"Not found");
-    if (strcmp(method,def?"POST":"PUT")) return error_reply(c,405,"Method not allowed");
+    bool mixer=!strcmp(url,"/api/mixer"),player=!strcmp(url,"/api/player"),library=!strcmp(url,"/api/library");
+    if (!eq && !output && !def && !mixer && !player && !library) return error_reply(c,404,"Not found");
+    if (strcmp(method,(def || mixer || player || library)?"POST":"PUT")) return error_reply(c,405,"Method not allowed");
     const char *ct=MHD_lookup_connection_value(c,MHD_HEADER_KIND,"Content-Type");
     if (!ct || (strcmp(ct,"application/json") && strcmp(ct,"application/json; charset=utf-8"))) return error_reply(c,415,"Content-Type must be application/json");
     struct json_object *body=parse_body(r);
@@ -384,9 +452,15 @@ static enum MHD_Result handle(void *cls,struct MHD_Connection *c,const char *url
     json_object_object_get_ex(app.snapshot,"live",&live);
     if (eq) {
         struct settings next=app.desired;
-        if (json_object_object_length(body)!=2 || !parse_eq(body,&next)) { code=400; error="Expected ten numeric gains (-12..12) and preamp (-24..0)"; }
+        bool known=true;
+        json_object_object_foreach(body,key,value) { (void)value; if (strcmp(key,"gains") && strcmp(key,"preamp") && strcmp(key,"maintain") && strcmp(key,"loudness_target")) known=false; }
+        if (!known || !parse_eq(body,&next)) { code=400; error="Expected ten numeric gains (-12..12), preamp (-24..12), and optional loudness settings"; }
         else if (!app.editing) { code=409; error="EQ is disconnected; check setup and selected output"; }
-        else { app.desired=next; app.eq_pending=true; }
+        else { app.desired=next; app.eq_pending=true; library_remember(&app.library,&next); }
+    } else if (mixer || player) {
+        error=desktop_action(mixer?"mixer":"player",body); if (error) code=400;
+    } else if (library) {
+        error=library_action(&app.library,body,&app.desired); if (error) code=400;
     } else if (output) {
         struct json_object *name,*outputs;
         bool valid=json_object_object_length(body)==1 && json_object_object_get_ex(body,"name",&name) && json_object_is_type(name,json_type_string) && valid_name(json_object_get_string(name)) && strlen(json_object_get_string(name))==(size_t)json_object_get_string_len(name);
@@ -403,7 +477,7 @@ static enum MHD_Result handle(void *cls,struct MHD_Connection *c,const char *url
         else if (!json_object_get_boolean(cap)) { code=409; error="Connect the EQ to an output first"; }
         else { app.default_pending=true; app.default_error[0]=0; }
     }
-    if (!error && !def) { app.revision++; app.changed_at=now(); app.persist_pending=true; }
+    if (!error && (eq || output)) { app.revision++; app.changed_at=now(); app.persist_pending=true; }
     unsigned revision=app.revision;
     pthread_mutex_unlock(&app.mutex); json_object_put(body);
     if (error) return error_reply(c,code,error);
@@ -512,6 +586,13 @@ out:
 }
 int main(int argc,char **argv) {
     setlocale(LC_NUMERIC,"C");
+    const char *port=getenv("EQWEB_PORT");
+    if (port) {
+        char *end; errno=0; unsigned long n=strtoul(port,&end,10);
+        if (errno || end==port || *end || n<1024 || n>65535) { fputs("EQWEB_PORT must be 1024–65535\n",stderr); return 2; }
+        listen_port=n; snprintf(host_name,sizeof(host_name),"127.0.0.1:%u",listen_port);
+        snprintf(origin_url,sizeof(origin_url),"http://%s",host_name);
+    }
     snprintf(app.instance,sizeof(app.instance),"%ld-%.9f",(long)getpid(),now());
     if (paths()) { fputs("HOME and XDG paths must be absolute and fit PATH_MAX\n",stderr); return 1; }
     snprintf(app.desired.output,sizeof(app.desired.output),"eqweb.unselected");
@@ -552,6 +633,7 @@ int main(int argc,char **argv) {
         printf("Installed: %s\nRestart desktop audio once to load the graph:\n  command systemctl --user restart pipewire pipewire-pulse wireplumber\nRun as your normal user; 'command' bypasses shell aliases that might add sudo.\nThis interrupts current playback. Ordinary EQ adjustments require no restart.\n",app.config_path); close(lock); return 0;
     }
     app.installed=installed_config(app.config_path);
+    if (library_open(&app.library,app.state_path)) { perror("Load presets and song EQ"); close(lock); return 1; }
     if (app.installed && loaded) { app.persist_pending=true; app.changed_at=now()-1; }
     pw_init(NULL,NULL);
     app.loop=pw_main_loop_new(NULL);
@@ -560,17 +642,19 @@ int main(int argc,char **argv) {
     if (!app.context) return 1;
     pw_loop_add_signal(pw_main_loop_get_loop(app.loop),SIGINT,quit,NULL);
     pw_loop_add_signal(pw_main_loop_get_loop(app.loop),SIGTERM,quit,NULL);
+    /* Workers inherit the signal mask installed by the PipeWire loop. */
+    if (desktop_start()) { fputs("Cannot start desktop controls\n",stderr); close(lock); return 1; }
     app.timer=pw_loop_add_timer(pw_main_loop_get_loop(app.loop),tick,NULL);
     struct timespec interval={0,50000000};
     pw_loop_update_timer(pw_main_loop_get_loop(app.loop),app.timer,&interval,&interval,false);
     tick(NULL,0);
-    struct sockaddr_in addr={.sin_family=AF_INET,.sin_port=htons(8932),.sin_addr={htonl(INADDR_LOOPBACK)}};
-    struct MHD_Daemon *http=MHD_start_daemon(MHD_USE_INTERNAL_POLLING_THREAD,8932,NULL,NULL,handle,NULL,
+    struct sockaddr_in addr={.sin_family=AF_INET,.sin_port=htons(listen_port),.sin_addr={htonl(INADDR_LOOPBACK)}};
+    struct MHD_Daemon *http=MHD_start_daemon(MHD_USE_INTERNAL_POLLING_THREAD,listen_port,NULL,NULL,handle,NULL,
         MHD_OPTION_SOCK_ADDR,&addr,MHD_OPTION_NOTIFY_COMPLETED,completed,NULL,
         MHD_OPTION_CONNECTION_LIMIT,(unsigned int)16,MHD_OPTION_CONNECTION_TIMEOUT,(unsigned int)5,
         MHD_OPTION_CONNECTION_MEMORY_LIMIT,(size_t)16384,MHD_OPTION_END);
-    if (!http) { fputs("Cannot listen on 127.0.0.1:8932\n",stderr); return 1; }
-    puts("EQ editor: " ORIGIN); fflush(stdout);
+    if (!http) { fprintf(stderr,"Cannot listen on %s\n",host_name); return 1; }
+    printf("EQ editor: %s\n",origin_url); fflush(stdout);
     pw_main_loop_run(app.loop);
     MHD_stop_daemon(http);
     if (app.persist_pending) persist();
@@ -578,5 +662,8 @@ int main(int argc,char **argv) {
     if (failed) fprintf(stderr,"Unsaved changes: %s\n",app.persist_error);
     disconnect_pw(); pw_loop_destroy_source(pw_main_loop_get_loop(app.loop),app.timer);
     pw_context_destroy(app.context); pw_main_loop_destroy(app.loop); pw_deinit();
+    desktop_stop(); library_close(&app.library);
+    if (*app.library.error) { fprintf(stderr,"%s\n",app.library.error); failed=true; }
+    if (app.desktop) json_object_put(app.desktop);
     json_object_put(app.snapshot); close(lock); return failed?1:0;
 }

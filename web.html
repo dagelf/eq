@@ -5,48 +5,117 @@
 <title>PipeWire EQ</title>
 <style>
 :root { color-scheme: light dark; font-family: system-ui,sans-serif; accent-color: #277bce; }
-body { max-width: 860px; margin: 3rem auto; padding: 0 1.2rem; line-height: 1.5; }
+* { box-sizing: border-box; }
+body { max-width: 1040px; margin: 2rem auto; padding: 0 1.2rem; line-height: 1.5; }
 h1 { margin-bottom: .2rem; font-size: 1.8rem; }
-p { margin: .5rem 0 1.2rem; }
-fieldset { border: 1px solid #8886; border-radius: 8px; padding: 1rem; margin: 1rem 0; }
-legend { font-weight: 600; }
-#editor { min-width: 0; }
-#bands { display: grid; grid-template-columns: repeat(10, minmax(4rem, 1fr)); gap: .6rem; overflow-x: auto; padding: .5rem .3rem 1rem; }
-.band { display: flex; flex-direction: column; align-items: center; gap: .6rem; white-space: nowrap; }
-.band label { font-size: .85rem; }
+p { margin: .5rem 0 1rem; }
+fieldset, details { min-width: 0; border: 1px solid #8886; border-radius: 8px; padding: 1rem; margin: 1rem 0; }
+legend, summary { font-weight: 600; }
+summary { cursor: pointer; }
+input, textarea, button, select { font: inherit; max-width: 100%; }
 input[type=range] { width: 100%; min-height: 32px; margin: 0; }
-input[type=number] { width: 5rem; padding: .3rem; box-sizing: border-box; font: inherit; }
-.band input[type=range] { writing-mode: vertical-lr; direction: rtl; width: 32px; height: 240px; }
-.band input[type=number] { width: 4rem; }
-.preamp { display: grid; grid-template-columns: 5rem 1fr 6rem; gap: 1rem; align-items: center; margin: .55rem 0; }
-button, select { font: inherit; padding: .5rem .7rem; max-width: 100%; }
+input[type=number] { width: 4.5rem; padding: .25rem; }
+input[type=text], textarea { padding: .5rem; border: 1px solid #8888; border-radius: 4px; }
+button, select { padding: .4rem .6rem; }
 button { cursor: pointer; } button:disabled { cursor: default; }
 .actions { display: flex; flex-wrap: wrap; align-items: center; gap: .6rem; }
-#output { flex: 1; min-width: 180px; }
-#errors { color: light-dark(#a51b16,#ffa7a0); white-space: pre-line; }
-.muted { opacity: .75; font-size: .9rem; }
+.actions > input[type=text], #output { flex: 1; min-width: 160px; }
+.eq-deck { display: flex; gap: 1rem; align-items: start; }
+#editor { flex: 1; margin: 0; padding: .8rem; }
+#bands { display: grid; grid-template-columns: repeat(10,minmax(3.2rem,1fr)); gap: .2rem; max-width: 38rem; overflow-x: auto; padding: .5rem .2rem .8rem; margin: auto; }
+.band { display: flex; flex-direction: column; align-items: center; gap: .5rem; white-space: nowrap; }
+.band label { font-size: .78rem; }
+.band input[type=range], #master { writing-mode: vertical-lr; direction: rtl; width: 28px; height: 390px; }
+.band input[type=number] { width: 3.2rem; font-size: .85rem; text-align: center; appearance: textfield; }
+.band input::-webkit-inner-spin-button, .band input::-webkit-outer-spin-button { -webkit-appearance: none; margin: 0; }
+#master-control { width: 7rem; flex-shrink: 0; margin: 0; padding: .8rem; text-align: center; }
+#master-control .band { padding-top: .5rem; }
+#master-value { width: 4.5rem; }
+.preamp { display: grid; grid-template-columns: 4.5rem 1fr 4.5rem; gap: .6rem; align-items: center; margin: .5rem 0; }
+#gain-summary { font-variant-numeric: tabular-nums; margin-bottom: .5rem; }
+#eq-text { width: 100%; min-height: 3.2rem; font-family: ui-monospace,monospace; resize: vertical; }
+#quickbar { margin-top: .6rem; }
+#quickbar [data-quickbar] { min-width: 2.2rem; }
+#autoload { flex: 1; min-width: 12rem; height: 8.2rem; }
+#errors, .error { color: light-dark(#a51b16,#ffa7a0); white-space: pre-line; }
+.muted { opacity: .75; font-size: .88rem; }
+#now-title { font-size: 1.2rem; font-weight: 600; overflow-wrap: anywhere; }
+#now-details { overflow-wrap: anywhere; }
+#player { min-width: 150px; }
+#player-progress { width: 100%; height: .75rem; cursor: pointer; }
+#player-progress[disabled] { cursor: default; }
+.mixer-group { margin: 1.2rem 0; }
+.mixer-group h3 { font-size: 1rem; margin-bottom: .4rem; }
+.mixer-row { display: grid; grid-template-columns: minmax(9rem,1fr) minmax(100px,2fr) 4.5rem auto; align-items: center; gap: .6rem; padding: .6rem 0; border-bottom: 1px solid #8883; }
+.mixer-label { font-size: .9rem; overflow-wrap: anywhere; }
+.mixer-route { grid-column: 2 / -1; width: 100%; }
+.mixer-row button[aria-pressed=true], #master-mute[aria-pressed=true] { background: #a51b16; color: white; }
 :focus-visible { outline: 3px solid #277bce; outline-offset: 3px; }
-@media (max-width: 480px) { body { margin-top: 1rem; } .preamp { gap: .4rem; grid-template-columns: 3.5rem 1fr 5.3rem; } }
+@media (max-width: 600px) {
+ body { margin-top: 1rem; padding: 0 .6rem; }
+ .eq-deck { gap: .4rem; } #editor { padding: .5rem; } #master-control { width: 5rem; padding: .4rem; }
+ .band input[type=range], #master { height: 360px; }
+ .mixer-row { grid-template-columns: minmax(0,1fr) 4.5rem auto; }
+ .mixer-label { grid-column: 1 / -1; } .mixer-route { grid-column: 1 / -1; }
+}
 </style>
 <h1>PipeWire EQ</h1>
-<p>Ten bands · stereo · Q 1.4</p>
+<p class="muted">Ten bands · stereo · Q 1.4</p>
 <p id="status" role="status" aria-live="polite">Connecting to editor…</p>
 <p id="errors" role="alert"></p>
+<fieldset id="player-control">
+ <legend>Now playing</legend>
+ <div class="actions"><label for="player">Player</label><select id="player"><option value="">Automatic · prefer playing</option></select><button id="previous" disabled aria-label="Previous track">Previous</button><button id="playpause" disabled>Play</button><button id="next" disabled aria-label="Next track">Next</button><button id="seek-back" disabled aria-label="Seek back 20 seconds">−20s</button><button id="seek-forward" disabled aria-label="Seek forward 20 seconds">+20s</button></div>
+ <div id="now-title">No player available</div>
+ <div id="now-details" class="muted"></div>
+ <progress id="player-progress" max="1" value="0" disabled aria-label="Track progress"></progress>
+ <div id="player-time" class="muted"></div>
+ <label><input id="remember-song" type="checkbox" checked> Remember EQ for each song</label>
+ <label><input id="output-log" type="checkbox" checked> Log songs and EQ to outputlog.txt</label>
+ <span id="song-status" class="muted" role="status"></span>
+ <p id="player-error" class="error"></p>
+</fieldset>
+<div class="eq-deck">
+ <fieldset id="editor" disabled>
+  <legend>Equalizer · dB</legend>
+  <div id="bands"></div>
+  <div class="preamp"><label for="preamp">Preamp</label><input id="preamp" type="range" min="-24" max="12" step="0.01" value="0" aria-label="Preamp gain in dB"><input id="preamp-value" type="number" min="-24" max="12" step="0.01" value="0" aria-label="Preamp gain in dB, numeric"></div>
+  <p id="gain-summary"></p>
+  <label><input id="maintain" type="checkbox"> Maintain loudness by adjusting preamp</label>
+  <label><input id="maintain-load" type="checkbox" checked> Maintain loudness when loading</label>
+  <p id="compensation" class="muted">Average is the sum of band gains ÷ 10; an estimate of gain, not measured loudness.</p>
+  <div class="actions" id="quickbar"><button id="reset">Reset to flat</button></div>
+ </fieldset>
+ <fieldset id="master-control" disabled>
+  <legend>Master</legend>
+  <div class="band"><label for="master">EQ volume</label><input id="master" type="range" min="0" max="150" step="1" value="100" aria-label="Master volume percent"><input id="master-value" type="number" min="0" max="150" step="1" value="100" aria-label="Master volume percent, numeric"><span class="muted">%</span><button id="master-mute" aria-pressed="false">Mute</button></div>
+  <p id="master-help" class="muted" role="status">EQ volume only affects applications routed to EQ Web Sink.</p>
+ </fieldset>
+</div>
+<p id="saved" role="status" class="muted"></p>
+<fieldset id="presets">
+ <legend>Presets &amp; values</legend>
+ <div class="actions"><label for="preset-name">Name</label><input id="preset-name" type="text" maxlength="128" placeholder="My preset"><button id="preset-save">Save preset</button></div>
+ <div class="actions"><label for="preset-select">Saved</label><select id="preset-select"><option value="">Choose a preset…</option></select><button id="preset-load">Load</button><button id="preset-delete">Delete</button><button id="preset-quickbar">Quickbar</button><button id="preset-quickbar-clear">Clear</button></div>
+ <div class="actions"><label for="autoload">Autoload</label><select id="autoload" size="6" aria-label="Autoload presets with the mouse wheel"></select></div>
+ <p class="muted">Roll the mouse wheel over Autoload to apply the next or previous preset.</p>
+ <p id="preset-status" role="status" class="muted"></p>
+ <label for="eq-text">Current values · edit or paste to apply live</label>
+ <textarea id="eq-text" spellcheck="false" aria-describedby="text-help text-error"></textarea>
+ <div class="actions"><button id="copy-values">Copy values</button><span id="text-help" class="muted">JSONL, or 10 band gains followed by an optional preamp value.</span></div>
+ <p id="text-error" role="status" class="error"></p>
+</fieldset>
 <fieldset>
  <legend>Output</legend>
- <div class="actions"><label for="output">Physical output</label><select id="output" disabled><option>Loading…</option></select></div>
- <p class="muted">The EQ sends audio only to this output.</p>
- <button id="default" disabled>Use EQ as default</button>
- <p class="muted">Existing application streams stay under your system mixer’s control.</p>
+ <div class="actions"><label for="output">Physical output</label><select id="output" disabled><option>Loading…</option></select><button id="default" disabled>Use EQ as default</button></div>
+ <p class="muted">Choose where the EQ sends audio. Output changes and Bluetooth reconnection need no audio restart. When EQ is the default, applications using this device are routed through it automatically. Later manual routing changes are respected.</p>
 </fieldset>
-<fieldset id="editor" disabled>
- <legend>Equalizer</legend>
- <div id="bands"></div>
- <div class="preamp"><label for="preamp">Preamp</label><input id="preamp" type="range" min="-24" max="0" step="0.1" value="0" aria-label="Preamp gain in dB"><input id="preamp-value" type="number" min="-24" max="0" step="0.1" value="0" aria-label="Preamp gain in dB, numeric"></div>
- <p class="muted">Gains are in dB. Lower the preamp when boosting bands to leave headroom.</p>
- <button id="reset">Reset to flat</button>
-</fieldset>
-<p id="saved" role="status" class="muted"></p>
-<p class="muted">Changes save automatically. The saved EQ keeps working when this editor closes.</p>
+<details id="mixer-panel" open>
+ <summary>Audio mixer</summary>
+ <p class="muted">Playback, recording, output and input volumes. Channel balance is preserved when changing volume.</p>
+ <p id="mixer-error" class="error"></p>
+ <div id="mixer"></div>
+</details>
+<p class="muted">EQ changes, presets and song settings save automatically. The last applied EQ keeps working when the editor closes.</p>
 <script src="/app.js" defer></script>
 </html>

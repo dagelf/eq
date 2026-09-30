@@ -1,0 +1,753 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>EQ Web Python</title>
+  <style>
+    :root {
+      --bg: #f4efe8;
+      --panel: rgba(255, 251, 245, 0.92);
+      --line: #d7cbba;
+      --ink: #181410;
+      --muted: #6d655a;
+      --accent: #156f63;
+      --accent2: #c06b14;
+      --danger: #b3261e;
+      --shadow: 0 18px 50px rgba(52, 39, 20, 0.08);
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: "IBM Plex Sans", "Segoe UI", sans-serif;
+      color: var(--ink);
+      background:
+        radial-gradient(circle at top left, rgba(21,111,99,0.12), transparent 32%),
+        radial-gradient(circle at top right, rgba(192,107,20,0.14), transparent 28%),
+        linear-gradient(180deg, #f8f3eb, #ece4d6);
+    }
+    .wrap {
+      max-width: 1260px;
+      margin: 0 auto;
+      padding: 24px;
+      display: grid;
+      gap: 20px;
+    }
+    .hero h1 {
+      margin: 0 0 10px;
+      font-family: "IBM Plex Mono", monospace;
+      font-size: clamp(2rem, 5vw, 3.2rem);
+      letter-spacing: -0.05em;
+    }
+    .hero p {
+      margin: 0;
+      max-width: 70ch;
+      color: var(--muted);
+      line-height: 1.5;
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: 340px 1fr;
+      gap: 20px;
+      align-items: start;
+    }
+    .panel {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 22px;
+      padding: 18px;
+      box-shadow: var(--shadow);
+      display: grid;
+      gap: 14px;
+    }
+    label {
+      display: grid;
+      gap: 6px;
+      font-size: 0.92rem;
+      color: var(--muted);
+    }
+    input, select, button, textarea {
+      font: inherit;
+    }
+    input[type="text"], input[type="number"], select, textarea {
+      width: 100%;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      padding: 10px 12px;
+      background: rgba(255,255,255,0.82);
+      color: var(--ink);
+    }
+    input[type="range"] {
+      width: 100%;
+      accent-color: var(--accent);
+    }
+    button {
+      border: 0;
+      border-radius: 999px;
+      padding: 11px 16px;
+      cursor: pointer;
+      color: white;
+      background: var(--ink);
+    }
+    button.alt {
+      color: var(--ink);
+      background: white;
+      border: 1px solid var(--line);
+    }
+    button.warn {
+      background: var(--accent2);
+    }
+    button.danger {
+      background: var(--danger);
+    }
+    .actions, .row {
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+    .status {
+      min-height: 48px;
+      padding: 12px 14px;
+      border-radius: 14px;
+      background: rgba(21,111,99,0.08);
+      line-height: 1.4;
+    }
+    .tiny {
+      font-size: 0.86rem;
+      line-height: 1.45;
+      color: var(--muted);
+    }
+    .toolbar {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 12px;
+      align-items: end;
+    }
+    .band-list {
+      display: grid;
+      gap: 14px;
+    }
+    .band {
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      padding: 14px;
+      background: rgba(255,255,255,0.7);
+      display: grid;
+      gap: 12px;
+    }
+    .band-head {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 12px;
+    }
+    .band-title {
+      font-family: "IBM Plex Mono", monospace;
+      font-weight: 700;
+    }
+    .band-main {
+      display: grid;
+      grid-template-columns: minmax(120px, 180px) 1fr minmax(88px, 108px);
+      gap: 12px;
+      align-items: center;
+    }
+    .readout {
+      font-family: "IBM Plex Mono", monospace;
+      color: var(--accent);
+      text-align: right;
+    }
+    details {
+      border-top: 1px solid var(--line);
+      padding-top: 10px;
+    }
+    summary {
+      cursor: pointer;
+      list-style: none;
+      font-family: "IBM Plex Mono", monospace;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    summary::-webkit-details-marker { display: none; }
+    summary::after { content: "+"; }
+    details[open] summary::after { content: "-"; }
+    .advanced {
+      display: grid;
+      gap: 12px;
+      margin-top: 12px;
+    }
+    .advanced-grid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 12px;
+    }
+    pre {
+      margin: 0;
+      max-height: 420px;
+      overflow: auto;
+      border-radius: 16px;
+      background: #16120f;
+      color: #e8e1d8;
+      padding: 16px;
+      font-size: 0.88rem;
+    }
+    textarea {
+      min-height: 220px;
+      resize: vertical;
+      font-family: "IBM Plex Mono", monospace;
+      font-size: 0.9rem;
+    }
+    @media (max-width: 980px) {
+      .grid { grid-template-columns: 1fr; }
+      .toolbar, .advanced-grid, .band-main { grid-template-columns: 1fr; }
+    }
+    @media (max-width: 560px) {
+      .wrap { padding: 14px; }
+      .actions button { width: 100%; }
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <section class="hero">
+      <h1>PipeWire EQ Web</h1>
+      <p>Python rewrite. Gain-first editing is local and immediate. Save and apply are explicit. Detailed band tuning stays collapsed until you open it.</p>
+    </section>
+
+    <section class="grid">
+      <aside class="panel">
+        <label>Description
+          <input id="description" placeholder="EQ Web Sink">
+        </label>
+        <label>Sink name
+          <input id="sinkName" placeholder="eqweb">
+        </label>
+        <label>Sink label
+          <input id="sinkLabel" placeholder="EQ Web Sink">
+        </label>
+        <label>Auto apply after save
+          <select id="autoApply">
+            <option value="false">No</option>
+            <option value="true">Yes</option>
+          </select>
+        </label>
+        <label>Template name
+          <input id="templateName" placeholder="Desk neutral">
+        </label>
+        <label>Saved templates
+          <select id="templateSelect"></select>
+        </label>
+        <div class="actions">
+          <button id="saveTemplate" class="alt" type="button">Save template</button>
+          <button id="loadTemplate" class="alt" type="button">Load template</button>
+        </div>
+        <div class="actions">
+          <button id="addBand" class="alt" type="button">Add band</button>
+          <button id="save" type="button">Save</button>
+          <button id="apply" class="warn" type="button">Apply</button>
+        </div>
+        <div id="status" class="status">Ready.</div>
+        <div class="tiny">
+          <div>Config path: <code id="configPath"></code></div>
+          <div>State path: <code id="statePath"></code></div>
+        </div>
+      </aside>
+
+      <main class="panel">
+        <div class="toolbar">
+          <label>Gain min
+            <input id="gainMin" type="number" step="0.1" value="-12">
+          </label>
+          <label>Gain max
+            <input id="gainMax" type="number" step="0.1" value="12">
+          </label>
+          <label>Freq slider scale
+            <select id="freqScale">
+              <option value="log">Log</option>
+              <option value="linear">Linear</option>
+            </select>
+          </label>
+        </div>
+        <div class="tiny">0 dB gain bands are skipped silently when rendering the PipeWire graph. Gain limits and frequency slider scale are browser-local UI settings.</div>
+        <div id="bands" class="band-list"></div>
+      </main>
+    </section>
+
+    <section class="panel">
+      <div class="row">
+        <label style="flex: 1 1 220px;">Preset format
+          <select id="exchangeFormat">
+            <option value="equalizer-apo">Equalizer APO</option>
+            <option value="graphic-eq">GraphicEQ / AutoEq</option>
+            <option value="eqweb-json">eqweb JSON</option>
+          </select>
+        </label>
+        <div class="actions" style="align-self: end;">
+          <button id="importBtn" class="alt" type="button">Import</button>
+          <button id="exportBtn" class="alt" type="button">Export</button>
+        </div>
+      </div>
+      <textarea id="exchangeText" placeholder="Paste Equalizer APO, GraphicEQ, or eqweb JSON here."></textarea>
+    </section>
+
+    <section class="panel">
+      <strong>Generated PipeWire fragment</strong>
+      <pre id="render"></pre>
+    </section>
+  </div>
+
+  <template id="bandTemplate">
+    <article class="band">
+      <div class="band-head">
+        <strong class="band-title"></strong>
+        <button class="danger remove-band" type="button">Remove</button>
+      </div>
+      <div class="band-main">
+        <label>ID
+          <input data-field="id" type="text" placeholder="band1">
+        </label>
+        <input data-field="gain_db" type="range" min="-12" max="12" step="0.1">
+        <div class="readout" data-readout="gain_db">0.0 dB</div>
+      </div>
+      <input data-number="gain_db" type="number" min="-12" max="12" step="0.1">
+      <details>
+        <summary>Advanced band settings</summary>
+        <div class="advanced">
+          <div class="advanced-grid">
+            <label>Type
+              <select data-field="type">
+                <option value="lowshelf">Low shelf</option>
+                <option value="peaking">Peaking</option>
+                <option value="highshelf">High shelf</option>
+                <option value="lowpass">Low pass</option>
+                <option value="highpass">High pass</option>
+              </select>
+            </label>
+            <label>Frequency
+              <input data-number="freq" type="number" min="10" max="30000" step="1">
+            </label>
+            <label>Q
+              <input data-number="q" type="number" min="0.05" max="20" step="0.01">
+            </label>
+          </div>
+          <div class="advanced-grid">
+            <label>Frequency slider
+              <input data-field="freq" type="range">
+            </label>
+            <label>Q slider
+              <input data-field="q" type="range" min="0.05" max="20" step="0.01">
+            </label>
+            <div class="tiny" data-role="note">Pass filters ignore gain. Peaking and shelves at 0 dB are omitted on apply.</div>
+          </div>
+          <div class="advanced-grid tiny">
+            <div data-readout="freq"></div>
+            <div data-readout="q"></div>
+            <div></div>
+          </div>
+        </div>
+      </details>
+    </article>
+  </template>
+
+  <script>
+    const UI_DEFAULTS = { gainMin: -12, gainMax: 12, freqScale: "log" };
+    const state = { config: null, render: "", ui: loadUISettings() };
+    const bandsEl = document.getElementById("bands");
+    const renderEl = document.getElementById("render");
+    const statusEl = document.getElementById("status");
+    const templateEl = document.getElementById("bandTemplate");
+
+    function loadUISettings() {
+      try {
+        return { ...UI_DEFAULTS, ...(JSON.parse(localStorage.getItem("eqweb-py-ui") || "{}")) };
+      } catch {
+        return { ...UI_DEFAULTS };
+      }
+    }
+
+    function saveUISettings() {
+      localStorage.setItem("eqweb-py-ui", JSON.stringify(state.ui));
+    }
+
+    function defaultBand(index) {
+      return { id: `band${index + 1}`, type: "peaking", freq: 1000, q: 1, gain_db: 0 };
+    }
+
+    function freqToSliderValue(freq) {
+      const min = 10;
+      const max = 22000;
+      if (state.ui.freqScale === "linear") {
+        return Math.max(min, Math.min(max, Number(freq)));
+      }
+      const ratio = (Math.log10(Math.max(min, Math.min(max, Number(freq)))) - Math.log10(min)) / (Math.log10(max) - Math.log10(min));
+      return ratio * 1000;
+    }
+
+    function sliderValueToFreq(value) {
+      const min = 10;
+      const max = 22000;
+      if (state.ui.freqScale === "linear") {
+        return Math.max(min, Math.min(max, Number(value)));
+      }
+      const ratio = Math.max(0, Math.min(1000, Number(value))) / 1000;
+      return 10 ** (Math.log10(min) + ratio * (Math.log10(max) - Math.log10(min)));
+    }
+
+    function setFreqSliderMode(slider) {
+      if (state.ui.freqScale === "linear") {
+        slider.min = "10";
+        slider.max = "22000";
+        slider.step = "1";
+      } else {
+        slider.min = "0";
+        slider.max = "1000";
+        slider.step = "1";
+      }
+    }
+
+    function setGainLimits(node) {
+      const gainSlider = node.querySelector('[data-field="gain_db"]');
+      const gainNumber = node.querySelector('[data-number="gain_db"]');
+      gainSlider.min = String(state.ui.gainMin);
+      gainSlider.max = String(state.ui.gainMax);
+      gainNumber.min = String(state.ui.gainMin);
+      gainNumber.max = String(state.ui.gainMax);
+    }
+
+    function updateBandTitle(node, index) {
+      const id = node.querySelector('[data-field="id"]').value || `band${index + 1}`;
+      const freq = Number(node.querySelector('[data-number="freq"]').value || 0);
+      node.querySelector(".band-title").textContent = `Band ${index + 1} · ${id} · ${Math.round(freq)} Hz`;
+    }
+
+    function syncGainDisable(node) {
+      const type = node.querySelector('[data-field="type"]').value;
+      const disabled = type === "lowpass" || type === "highpass";
+      const gainSlider = node.querySelector('[data-field="gain_db"]');
+      const gainNumber = node.querySelector('[data-number="gain_db"]');
+      const gainReadout = node.querySelector('[data-readout="gain_db"]');
+      const note = node.querySelector('[data-role="note"]');
+      gainSlider.disabled = disabled;
+      gainNumber.disabled = disabled;
+      note.textContent = disabled ? "Pass filters ignore gain." : "Peaking and shelves at 0 dB are omitted on apply.";
+      if (disabled) {
+        gainSlider.value = "0";
+        gainNumber.value = "0";
+        gainReadout.textContent = "0.0 dB";
+      }
+    }
+
+    function bindBand(node, band, index) {
+      node.querySelector('[data-field="id"]').value = band.id;
+      node.querySelector('[data-field="type"]').value = band.type;
+
+      const freqSlider = node.querySelector('[data-field="freq"]');
+      const freqNumber = node.querySelector('[data-number="freq"]');
+      const qSlider = node.querySelector('[data-field="q"]');
+      const qNumber = node.querySelector('[data-number="q"]');
+      const gainSlider = node.querySelector('[data-field="gain_db"]');
+      const gainNumber = node.querySelector('[data-number="gain_db"]');
+      const gainReadout = node.querySelector('[data-readout="gain_db"]');
+      const freqReadout = node.querySelector('[data-readout="freq"]');
+      const qReadout = node.querySelector('[data-readout="q"]');
+
+      setFreqSliderMode(freqSlider);
+      setGainLimits(node);
+
+      const syncFreq = (nextFreq) => {
+        const value = Math.max(10, Math.min(30000, Number(nextFreq)));
+        freqNumber.value = Math.round(value);
+        freqSlider.value = state.ui.freqScale === "linear" ? String(Math.round(value)) : String(freqToSliderValue(value));
+        freqReadout.textContent = `${Math.round(value)} Hz`;
+      };
+      const syncQ = (nextQ) => {
+        const value = Math.max(0.05, Math.min(20, Number(nextQ)));
+        qNumber.value = value;
+        qSlider.value = value;
+        qReadout.textContent = `Q ${value.toFixed(2)}`;
+      };
+      const syncGain = (nextGain) => {
+        const value = Math.max(state.ui.gainMin, Math.min(state.ui.gainMax, Number(nextGain)));
+        gainNumber.value = value;
+        gainSlider.value = value;
+        gainReadout.textContent = `${value.toFixed(1)} dB`;
+      };
+
+      freqSlider.addEventListener("input", () => syncFreq(state.ui.freqScale === "linear" ? freqSlider.value : sliderValueToFreq(freqSlider.value)));
+      freqNumber.addEventListener("input", () => syncFreq(freqNumber.value));
+      qSlider.addEventListener("input", () => syncQ(qSlider.value));
+      qNumber.addEventListener("input", () => syncQ(qNumber.value));
+      gainSlider.addEventListener("input", () => syncGain(gainSlider.value));
+      gainNumber.addEventListener("input", () => syncGain(gainNumber.value));
+      node.querySelector('[data-field="type"]').addEventListener("change", () => syncGainDisable(node));
+      node.querySelector(".remove-band").addEventListener("click", () => {
+        node.remove();
+        retitleBands();
+      });
+      node.querySelector('[data-field="id"]').addEventListener("input", () => retitleBands());
+      freqNumber.addEventListener("input", () => retitleBands());
+
+      syncFreq(band.freq);
+      syncQ(band.q);
+      syncGain(band.gain_db);
+      syncGainDisable(node);
+      updateBandTitle(node, index);
+    }
+
+    function renderBands(bands) {
+      bandsEl.innerHTML = "";
+      bands.forEach((band, index) => {
+        const node = templateEl.content.firstElementChild.cloneNode(true);
+        bindBand(node, band, index);
+        bandsEl.appendChild(node);
+      });
+      retitleBands();
+    }
+
+    function retitleBands() {
+      [...bandsEl.children].forEach((node, index) => updateBandTitle(node, index));
+    }
+
+    function hydrateTemplates() {
+      const select = document.getElementById("templateSelect");
+      const name = document.getElementById("templateName");
+      const current = select.value || name.value;
+      select.innerHTML = "";
+      const placeholder = document.createElement("option");
+      placeholder.value = "";
+      placeholder.textContent = (state.config.templates || []).length ? "Select a template" : "No saved templates";
+      select.appendChild(placeholder);
+      (state.config.templates || []).forEach((tpl) => {
+        const option = document.createElement("option");
+        option.value = tpl.name;
+        option.textContent = tpl.name;
+        select.appendChild(option);
+      });
+      if ((state.config.templates || []).some((tpl) => tpl.name === current)) {
+        select.value = current;
+        name.value = current;
+      }
+    }
+
+    function hydrateMeta() {
+      document.getElementById("description").value = state.config.description || "";
+      document.getElementById("sinkName").value = state.config.sink_name || "";
+      document.getElementById("sinkLabel").value = state.config.sink_label || "";
+      document.getElementById("autoApply").value = String(Boolean(state.config.auto_apply));
+      document.getElementById("configPath").textContent = state.config.config_path || "";
+      document.getElementById("statePath").textContent = state.config.state_path || "";
+      document.getElementById("gainMin").value = state.ui.gainMin;
+      document.getElementById("gainMax").value = state.ui.gainMax;
+      document.getElementById("freqScale").value = state.ui.freqScale;
+      renderEl.textContent = state.render || "";
+      statusEl.textContent = state.config.last_apply_note || "Ready.";
+      hydrateTemplates();
+    }
+
+    async function fetchConfig() {
+      const res = await fetch("/api/config");
+      const data = await res.json();
+      state.config = data.config;
+      state.render = data.render || "";
+      hydrateMeta();
+      renderBands(state.config.bands || []);
+    }
+
+    function collectBands() {
+      return [...bandsEl.children].map((node) => ({
+        id: node.querySelector('[data-field="id"]').value,
+        type: node.querySelector('[data-field="type"]').value,
+        freq: Number(node.querySelector('[data-number="freq"]').value),
+        q: Number(node.querySelector('[data-number="q"]').value),
+        gain_db: Number(node.querySelector('[data-number="gain_db"]').value)
+      }));
+    }
+
+    function collectConfig() {
+      return {
+        description: document.getElementById("description").value,
+        sink_name: document.getElementById("sinkName").value,
+        sink_label: document.getElementById("sinkLabel").value,
+        channels: 2,
+        auto_apply: document.getElementById("autoApply").value === "true",
+        last_apply_note: state.config.last_apply_note || "",
+        bands: collectBands(),
+        templates: state.config.templates || []
+      };
+    }
+
+    async function persistConfig(config) {
+      const res = await fetch("/api/config", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(config)
+      });
+      const data = await res.json();
+      if (!res.ok || !data.ok) {
+        throw new Error(data.message || "save failed");
+      }
+      return data;
+    }
+
+    async function save(applyAfter = false) {
+      const data = await persistConfig(collectConfig());
+      state.config = data.config;
+      state.render = data.render || state.render;
+      hydrateMeta();
+      if (!applyAfter || state.config.auto_apply) {
+        statusEl.textContent = data.message || "Saved.";
+        return;
+      }
+      const res = await fetch("/api/apply", { method: "POST" });
+      const applied = await res.json();
+      if (!res.ok || !applied.ok) {
+        throw new Error(applied.message || "apply failed");
+      }
+      state.config = applied.config;
+      state.render = applied.render || state.render;
+      hydrateMeta();
+      statusEl.textContent = applied.message || "Applied.";
+    }
+
+    function collectTemplate(name) {
+      const cfg = collectConfig();
+      return {
+        name,
+        description: cfg.description,
+        sink_name: cfg.sink_name,
+        sink_label: cfg.sink_label,
+        channels: cfg.channels,
+        bands: cfg.bands.map((band) => ({ ...band }))
+      };
+    }
+
+    async function saveTemplate() {
+      const name = (document.getElementById("templateName").value || document.getElementById("templateSelect").value).trim();
+      if (!name) throw new Error("template name is required");
+      const nextTemplates = [...(state.config.templates || [])];
+      const existing = nextTemplates.findIndex((tpl) => tpl.name === name);
+      const template = collectTemplate(name);
+      if (existing >= 0) nextTemplates[existing] = template;
+      else nextTemplates.push(template);
+      const draft = collectConfig();
+      draft.templates = nextTemplates;
+      const data = await persistConfig(draft);
+      state.config = data.config;
+      state.render = data.render || state.render;
+      hydrateMeta();
+      document.getElementById("templateSelect").value = name;
+      document.getElementById("templateName").value = name;
+      statusEl.textContent = `Template "${name}" saved.`;
+    }
+
+    function loadTemplate() {
+      const name = document.getElementById("templateSelect").value || document.getElementById("templateName").value.trim();
+      const template = (state.config.templates || []).find((tpl) => tpl.name === name);
+      if (!template) throw new Error("select a saved template to load");
+      state.config = {
+        ...state.config,
+        description: template.description,
+        sink_name: template.sink_name,
+        sink_label: template.sink_label,
+        channels: template.channels,
+        bands: template.bands.map((band) => ({ ...band }))
+      };
+      hydrateMeta();
+      renderBands(state.config.bands);
+      document.getElementById("templateSelect").value = template.name;
+      document.getElementById("templateName").value = template.name;
+      statusEl.textContent = `Template "${template.name}" loaded into the editor.`;
+    }
+
+    async function importPreset() {
+      const res = await fetch("/api/import", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          format: document.getElementById("exchangeFormat").value,
+          content: document.getElementById("exchangeText").value
+        })
+      });
+      const data = await res.json();
+      if (!res.ok || !data.ok) throw new Error(data.message || "import failed");
+      state.config = data.config;
+      state.render = data.render || state.render;
+      hydrateMeta();
+      renderBands(state.config.bands || []);
+      statusEl.textContent = data.message || "Imported.";
+    }
+
+    async function exportPreset() {
+      const res = await fetch("/api/export", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ format: document.getElementById("exchangeFormat").value })
+      });
+      const data = await res.json();
+      if (!res.ok || !data.ok) throw new Error(data.message || "export failed");
+      document.getElementById("exchangeText").value = data.content || "";
+      statusEl.textContent = data.message || "Exported.";
+    }
+
+    function updateUISettingHandlers() {
+      document.getElementById("gainMin").addEventListener("change", () => {
+        const min = Number(document.getElementById("gainMin").value);
+        const max = Number(document.getElementById("gainMax").value);
+        if (!(min < max)) {
+          showError(new Error("gain min must be less than gain max"));
+          document.getElementById("gainMin").value = state.ui.gainMin;
+          return;
+        }
+        state.ui.gainMin = min;
+        saveUISettings();
+        renderBands(collectBands());
+      });
+      document.getElementById("gainMax").addEventListener("change", () => {
+        const min = Number(document.getElementById("gainMin").value);
+        const max = Number(document.getElementById("gainMax").value);
+        if (!(min < max)) {
+          showError(new Error("gain max must be greater than gain min"));
+          document.getElementById("gainMax").value = state.ui.gainMax;
+          return;
+        }
+        state.ui.gainMax = max;
+        saveUISettings();
+        renderBands(collectBands());
+      });
+      document.getElementById("freqScale").addEventListener("change", () => {
+        state.ui.freqScale = document.getElementById("freqScale").value === "linear" ? "linear" : "log";
+        saveUISettings();
+        renderBands(collectBands());
+      });
+    }
+
+    function showError(err) {
+      statusEl.textContent = err.message || String(err);
+    }
+
+    document.getElementById("templateSelect").addEventListener("change", (event) => {
+      document.getElementById("templateName").value = event.target.value;
+    });
+    document.getElementById("addBand").addEventListener("click", () => {
+      const bands = collectBands();
+      bands.push(defaultBand(bands.length));
+      renderBands(bands);
+    });
+    document.getElementById("save").addEventListener("click", () => save(false).catch(showError));
+    document.getElementById("apply").addEventListener("click", () => save(true).catch(showError));
+    document.getElementById("saveTemplate").addEventListener("click", () => saveTemplate().catch(showError));
+    document.getElementById("loadTemplate").addEventListener("click", () => {
+      try {
+        loadTemplate();
+      } catch (err) {
+        showError(err);
+      }
+    });
+    document.getElementById("importBtn").addEventListener("click", () => importPreset().catch(showError));
+    document.getElementById("exportBtn").addEventListener("click", () => exportPreset().catch(showError));
+
+    updateUISettingHandlers();
+    fetchConfig().catch(showError);
+  </script>
+</body>
+</html>
