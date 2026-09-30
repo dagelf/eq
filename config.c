@@ -40,6 +40,11 @@ bool same_bluetooth_output(const char *a,const char *b) {
     char x[18],y[18];
     return bluetooth_address(a,x) && bluetooth_address(b,y) && !strcmp(x,y);
 }
+void output_key(const char *name,char key[NAME_SIZE]) {
+    char address[18];
+    if (bluetooth_address(name,address)) snprintf(key,NAME_SIZE,"bluez_output.%s",address);
+    else snprintf(key,NAME_SIZE,"%s",name);
+}
 static bool number(struct json_object *o, double lo, double hi, double *v) {
     if (!o || !(json_object_is_type(o,json_type_int) || json_object_is_type(o,json_type_double))) return false;
     *v=json_object_get_double(o);

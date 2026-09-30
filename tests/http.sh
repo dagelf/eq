@@ -40,6 +40,9 @@ check 400 -X POST -H 'Content-Type: application/json' -d '{"player":"missing","a
 check 400 -X POST -H 'Content-Type: application/json' -d '{"action":"save","name":"Bad","eq":{"gains":[1],"preamp":0}}' http://127.0.0.1:$EQWEB_PORT/api/library
 check 400 -X POST -H 'Content-Type: application/json' -d '{"action":"quickbar","eq":{"gains":[1],"preamp":0}}' http://127.0.0.1:$EQWEB_PORT/api/library
 check 400 -X POST -H 'Content-Type: application/json' -d '{"action":"maintain_load"}' http://127.0.0.1:$EQWEB_PORT/api/library
+check 400 -X POST -H 'Content-Type: application/json' -d '{"action":"fallback","enabled":"yes"}' http://127.0.0.1:$EQWEB_PORT/api/library
+check 400 -X POST -H 'Content-Type: application/json' -d '{"action":"fallback_device","device":null}' http://127.0.0.1:$EQWEB_PORT/api/library
+check 400 -X POST -H 'Content-Type: application/json' -d '{"action":"device_eq","output":"wrong.output","eq":{"gains":[0,0,0,0,0,0,0,0,0,0],"preamp":0}}' http://127.0.0.1:$EQWEB_PORT/api/library
 head -c 4097 /dev/zero > "$temp/large"
 check 413 -X PUT -H 'Content-Type: application/json' --data-binary "@$temp/large" http://127.0.0.1:$EQWEB_PORT/api/eq
 if ./eqweb setup --output test.output > "$temp/lock.log" 2>&1; then echo 'Setup bypassed process lock'; exit 1; fi

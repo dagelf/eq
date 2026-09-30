@@ -1,5 +1,7 @@
 #define _GNU_SOURCE
+#include "json_util.h"
 #include "desktop.h"
+#include "eq.h"
 #include <gio/gio.h>
 #include <pulse/pulseaudio.h>
 #include <pthread.h>
@@ -21,15 +23,14 @@ static struct {
     pa_context *pulse;
     GDBusConnection *bus;
     struct json_object *mixer,*players;
+    struct json_object *output_volumes;
+    unsigned next_output_epoch, output_epoch;
+    char output[NAME_SIZE], master_token[1024], master_error[512];
+    bool master_ready;
     char mixer_error[512],player_error[512],action_error[512];
 } d={.mutex=PTHREAD_MUTEX_INITIALIZER};
 static double stamp(void) { return g_get_monotonic_time()/1e6; }
-static struct json_object *get(struct json_object *o,const char *key) {
-    struct json_object *v=NULL; json_object_object_get_ex(o,key,&v); return v;
-}
-static const char *str(struct json_object *o,const char *key) {
-    struct json_object *v=get(o,key); return v?json_object_get_string(v):"";
-}
+
 static void string(struct json_object *o,const char *key,const char *v) { json_object_object_add(o,key,json_object_new_string(v?v:"")); }
 static void boolean(struct json_object *o,const char *key,bool v) { json_object_object_add(o,key,json_object_new_boolean(v)); }
 static void number(struct json_object *o,const char *key,double v) { json_object_object_add(o,key,json_object_new_double(v)); }
@@ -106,45 +107,89 @@ static void success(pa_context *c,int ok,void *data) { (void)c; *(bool *)data=ok
 static struct json_object *find_token(const char *token) {
     for (size_t i=0;i<json_object_array_length(d.mixer);i++) {
         struct json_object *o=json_object_array_get_idx(d.mixer,i);
-        if (!strcmp(str(o,"token"),token)) return o;
+        if (!strcmp(json_string(o,"token"),token)) return o;
     }
     return NULL;
 }
 static void mixer_action(struct json_object *body) {
-    struct json_object *item=find_token(str(body,"token"));
+    struct json_object *item=find_token(json_string(body,"token"));
     if (!item || !d.pulse || pa_context_get_state(d.pulse)!=PA_CONTEXT_READY) {
         snprintf(d.action_error,sizeof(d.action_error),"That audio control is no longer available."); return;
     }
-    uint32_t id=json_object_get_int64(get(item,"id"));
-    const char *kind=str(item,"kind"),*action=str(body,"action");
+    uint32_t id=json_object_get_int64(json_get(item,"id"));
+    const char *kind=json_string(item,"kind"),*action=json_string(body,"action");
     pa_operation *op=NULL; bool ok=false;
     if (!strcmp(action,"volume")) {
-        if (!json_object_get_boolean(get(item,"writable"))) {
+        if (!json_object_get_boolean(json_get(item,"writable"))) {
             snprintf(d.action_error,sizeof(d.action_error),"This stream does not support volume changes."); return;
         }
-        struct json_object *channels=get(item,"channels");
+        struct json_object *channels=json_get(item,"channels");
         pa_cvolume volume={.channels=json_object_array_length(channels)};
         for (unsigned i=0;i<volume.channels;i++) volume.values[i]=json_object_get_int64(json_object_array_get_idx(channels,i));
-        pa_cvolume_scale(&volume,lround(json_object_get_double(get(body,"value"))*PA_VOLUME_NORM/100));
+        pa_cvolume_scale(&volume,lround(json_object_get_double(json_get(body,"value"))*PA_VOLUME_NORM/100));
         if (!strcmp(kind,"output")) op=pa_context_set_sink_volume_by_index(d.pulse,id,&volume,success,&ok);
         if (!strcmp(kind,"input")) op=pa_context_set_source_volume_by_index(d.pulse,id,&volume,success,&ok);
         if (!strcmp(kind,"playback")) op=pa_context_set_sink_input_volume(d.pulse,id,&volume,success,&ok);
         if (!strcmp(kind,"recording")) op=pa_context_set_source_output_volume(d.pulse,id,&volume,success,&ok);
     } else if (!strcmp(action,"mute")) {
-        bool mute=json_object_get_boolean(get(body,"value"));
+        bool mute=json_object_get_boolean(json_get(body,"value"));
         if (!strcmp(kind,"output")) op=pa_context_set_sink_mute_by_index(d.pulse,id,mute,success,&ok);
         if (!strcmp(kind,"input")) op=pa_context_set_source_mute_by_index(d.pulse,id,mute,success,&ok);
         if (!strcmp(kind,"playback")) op=pa_context_set_sink_input_mute(d.pulse,id,mute,success,&ok);
         if (!strcmp(kind,"recording")) op=pa_context_set_source_output_mute(d.pulse,id,mute,success,&ok);
     } else if (!strcmp(action,"move")) {
-        struct json_object *target=find_token(str(body,"target"));
-        if (target && !strcmp(kind,"playback") && !strcmp(str(target,"kind"),"output"))
-            op=pa_context_move_sink_input_by_index(d.pulse,id,json_object_get_int64(get(target,"id")),success,&ok);
-        if (target && !strcmp(kind,"recording") && !strcmp(str(target,"kind"),"input"))
-            op=pa_context_move_source_output_by_index(d.pulse,id,json_object_get_int64(get(target,"id")),success,&ok);
+        struct json_object *target=find_token(json_string(body,"target"));
+        if (target && !strcmp(kind,"playback") && !strcmp(json_string(target,"kind"),"output"))
+            op=pa_context_move_sink_input_by_index(d.pulse,id,json_object_get_int64(json_get(target,"id")),success,&ok);
+        if (target && !strcmp(kind,"recording") && !strcmp(json_string(target,"kind"),"input"))
+            op=pa_context_move_source_output_by_index(d.pulse,id,json_object_get_int64(json_get(target,"id")),success,&ok);
     }
     if (!pulse_wait(op) || !ok) snprintf(d.action_error,sizeof(d.action_error),"Audio change failed: %s",pa_strerror(pa_context_errno(d.pulse)));
     else d.action_error[0]=0;
+}
+static struct json_object *master_item(void) {
+    for (size_t i=0;i<json_object_array_length(d.mixer);i++) {
+        struct json_object *item=json_object_array_get_idx(d.mixer,i);
+        if (!strcmp(json_string(item,"kind"),"output") && !strcmp(json_string(item,"name"),SINK_NAME)) return item;
+    }
+    return NULL;
+}
+static bool restore_master(struct json_object *item,const char *action,struct json_object *value) {
+    struct json_object *body=json_object_new_object();
+    string(body,"token",json_string(item,"token")); string(body,"action",action);
+    json_object_object_add(body,"value",json_object_get(value));
+    char previous[sizeof(d.action_error)]; snprintf(previous,sizeof(previous),"%s",d.action_error);
+    mixer_action(body);
+    snprintf(d.master_error,sizeof(d.master_error),"%s",d.action_error);
+    snprintf(d.action_error,sizeof(d.action_error),"%s",previous);
+    json_object_put(body); return !*d.master_error;
+}
+static void sync_master(void) {
+    if (!*d.output) return;
+    struct json_object *item=master_item();
+    if (!item || !json_object_get_boolean(json_get(item,"writable"))) { d.master_ready=false; return; }
+    if (strcmp(d.master_token,json_string(item,"token"))) {
+        snprintf(d.master_token,sizeof(d.master_token),"%s",json_string(item,"token")); d.master_ready=false;
+    }
+    char key[NAME_SIZE]; output_key(d.output,key);
+    struct json_object *saved=json_get(d.output_volumes,key);
+    if (!d.master_ready && saved) {
+        /* Apply attenuation before unmuting a restored output. */
+        bool muted=json_object_get_boolean(json_get(saved,"mute"));
+        if (muted && !restore_master(item,"mute",json_get(saved,"mute"))) return;
+        if (!restore_master(item,"volume",json_get(saved,"volume"))) return;
+        if (!muted && !restore_master(item,"mute",json_get(saved,"mute"))) return;
+        refresh_mixer(); item=master_item();
+        if (!item || fabs(json_object_get_double(json_get(item,"volume"))-json_object_get_double(json_get(saved,"volume")))>.01 ||
+            json_object_get_boolean(json_get(item,"mute"))!=muted) {
+            snprintf(d.master_error,sizeof(d.master_error),"Waiting for the output's saved master volume and mute"); return;
+        }
+    }
+    d.master_ready=true; d.master_error[0]=0;
+    struct json_object *value=json_object_new_object();
+    json_object_object_add(value,"volume",json_object_get(json_get(item,"volume")));
+    json_object_object_add(value,"mute",json_object_get(json_get(item,"mute")));
+    json_object_object_add(d.output_volumes,key,value);
 }
 #define PLAYER_PATH "/org/mpris/MediaPlayer2"
 #define PLAYER_IFACE "org.mpris.MediaPlayer2.Player"
@@ -188,14 +233,14 @@ static void refresh_players(void) {
             const char *track=NULL; g_variant_lookup(metadata,"mpris:trackid","o",&track); string(p,"track_id",track);
             g_variant_unref(metadata);
         }
-        json_object_array_add(players,p); g_variant_unref(result); /* props is a borrowed child of result */
+        json_object_array_add(players,p); g_variant_unref(props); g_variant_unref(result);
     }
-    g_variant_unref(names); /* array is a borrowed child of names */
+    g_variant_unref(array); g_variant_unref(names);
 out:
     json_object_put(d.players); d.players=players;
 }
 static void player_action(struct json_object *body) {
-    const char *id=str(body,"player"),*action=str(body,"action"),*method=NULL,*cap=NULL;
+    const char *id=json_string(body,"player"),*action=json_string(body,"action"),*method=NULL,*cap=NULL;
     if (!strcmp(action,"next")) { method="Next"; cap="CanGoNext"; }
     if (!strcmp(action,"previous")) { method="Previous"; cap="CanGoPrevious"; }
     if (!strcmp(action,"playpause")) method="PlayPause";
@@ -203,19 +248,19 @@ static void player_action(struct json_object *body) {
     if (!strcmp(action,"seek_relative")) { method="Seek"; cap="CanSeek"; }
     struct json_object *player=NULL;
     for (size_t i=0;i<json_object_array_length(d.players);i++) {
-        struct json_object *p=json_object_array_get_idx(d.players,i); if (!strcmp(str(p,"id"),id)) player=p;
+        struct json_object *p=json_object_array_get_idx(d.players,i); if (!strcmp(json_string(p,"id"),id)) player=p;
     }
-    if (player && !cap) cap=!strcmp(str(player,"status"),"Playing")?"CanPause":"CanPlay";
-    if (!player || !d.bus || !method || !json_object_get_boolean(get(player,"CanControl")) || !json_object_get_boolean(get(player,cap))) {
+    if (player && !cap) cap=!strcmp(json_string(player,"status"),"Playing")?"CanPause":"CanPlay";
+    if (!player || !d.bus || !method || !json_object_get_boolean(json_get(player,"CanControl")) || !json_object_get_boolean(json_get(player,cap))) {
         snprintf(d.action_error,sizeof(d.action_error),"That player or playback action is unavailable."); return;
     }
     GError *error=NULL;
     GVariant *args=NULL;
     if (!strcmp(action,"seek")) {
-        int64_t us=lround(json_object_get_double(get(body,"position"))*1e6);
-        args=g_variant_new("(ox)",str(player,"track_id"),us);
+        int64_t us=lround(json_object_get_double(json_get(body,"position"))*1e6);
+        args=g_variant_new("(ox)",json_string(player,"track_id"),us);
     } else if (!strcmp(action,"seek_relative")) {
-        int64_t us=lround(json_object_get_double(get(body,"offset"))*1e6);
+        int64_t us=lround(json_object_get_double(json_get(body,"offset"))*1e6);
         args=g_variant_new("(x)",us);
     }
     GVariant *result=bus_call(id,PLAYER_PATH,PLAYER_IFACE,method,args,&error); /* bus_call consumes args */
@@ -227,6 +272,10 @@ static void publish(void) {
     struct json_object *o=json_object_new_object();
     json_object_object_add(o,"mixer",json_object_get(d.mixer)); json_object_object_add(o,"players",json_object_get(d.players));
     string(o,"mixer_error",d.mixer_error); string(o,"player_error",d.player_error); string(o,"action_error",d.action_error);
+    string(o,"master_error",d.master_error); string(o,"master_output",d.output);
+    boolean(o,"master_ready",d.master_ready);
+    json_object_object_add(o,"master_epoch",json_object_new_int64(d.output_epoch));
+    json_object_object_add(o,"output_volumes",json_copy(d.output_volumes));
     pthread_mutex_lock(&d.mutex);
     if (d.snapshot) json_object_put(d.snapshot);
     d.snapshot=o; pthread_mutex_unlock(&d.mutex);
@@ -241,12 +290,26 @@ static void *worker(void *unused) {
         struct json_object *command=d.queued?d.queue[0]:NULL;
         if (command) { d.queued--; memmove(d.queue,d.queue+1,d.queued*sizeof(*d.queue)); }
         pthread_mutex_unlock(&d.mutex);
-        if (stop) { if (command) json_object_put(command); break; }
-        if (command) {
-            if (!strcmp(str(command,"kind"),"mixer")) mixer_action(command); else player_action(command);
-            json_object_put(command); refresh=0;
+        if (stop && !command) {
+            if (d.loop) { refresh_mixer(); sync_master(); }
+            publish(); break;
         }
-        if (stamp()>=refresh) { if (d.loop) refresh_mixer(); refresh_players(); publish(); refresh=stamp()+.75; }
+        bool update=command || stamp()>=refresh;
+        if (update && d.loop) { refresh_mixer(); sync_master(); }
+        if (command) {
+            const char *kind=json_string(command,"kind");
+            if (!strcmp(kind,"output")) {
+                snprintf(d.output,sizeof(d.output),"%s",json_string(command,"name"));
+                d.output_epoch=json_object_get_int64(json_get(command,"epoch")); d.master_ready=false;
+            } else if (!strcmp(kind,"mixer")) {
+                struct json_object *item=find_token(json_string(command,"token"));
+                if (item && item==master_item() && !d.master_ready) snprintf(d.action_error,sizeof(d.action_error),"EQ master volume is not ready; try again");
+                else mixer_action(command);
+            } else player_action(command);
+            json_object_put(command);
+            if (d.loop) { refresh_mixer(); sync_master(); }
+        }
+        if (update) { refresh_players(); publish(); refresh=stamp()+.75; }
         if (d.loop) pa_mainloop_iterate(d.loop,0,NULL);
         usleep(20000);
     }
@@ -255,23 +318,37 @@ static void *worker(void *unused) {
     if (d.bus) g_object_unref(d.bus);
     json_object_put(d.mixer); json_object_put(d.players); return NULL;
 }
-int desktop_start(void) {
-    int r=pthread_create(&d.thread,NULL,worker,NULL); d.started=r==0; return r;
+int desktop_start(struct json_object *output_volumes) {
+    d.output_volumes=output_volumes?json_copy(output_volumes):json_object_new_object();
+    int r=pthread_create(&d.thread,NULL,worker,NULL); d.started=r==0;
+    if (r) { json_object_put(d.output_volumes); d.output_volumes=NULL; }
+    return r;
 }
-void desktop_stop(void) {
-    if (!d.started) return;
+struct json_object *desktop_stop(void) {
+    if (!d.started) return NULL;
     pthread_mutex_lock(&d.mutex); d.stop=true; pthread_mutex_unlock(&d.mutex);
     pthread_join(d.thread,NULL);
     for (unsigned i=0;i<d.queued;i++) json_object_put(d.queue[i]);
     if (d.snapshot) json_object_put(d.snapshot);
+    struct json_object *volumes=d.output_volumes; d.output_volumes=NULL; return volumes;
+}
+const char *desktop_select_output(const char *output,unsigned *epoch) {
+    pthread_mutex_lock(&d.mutex);
+    if (d.queued>=32 || !d.started || d.stop) { pthread_mutex_unlock(&d.mutex); return "Desktop controls are busy; try again"; }
+    struct json_object *command=json_object_new_object();
+    string(command,"kind","output"); string(command,"name",output);
+    *epoch=++d.next_output_epoch;
+    json_object_object_add(command,"epoch",json_object_new_int64(*epoch));
+    d.queue[d.queued++]=command;
+    pthread_mutex_unlock(&d.mutex); return NULL;
 }
 struct json_object *desktop_snapshot(void) {
     pthread_mutex_lock(&d.mutex);
-    struct json_object *o=d.snapshot?json_tokener_parse(json_object_to_json_string(d.snapshot)):json_tokener_parse("{\"mixer\":[],\"players\":[]}");
+    struct json_object *o=d.snapshot?json_copy(d.snapshot):json_tokener_parse("{\"mixer\":[],\"players\":[]}");
     pthread_mutex_unlock(&d.mutex); return o;
 }
 const char *desktop_action(const char *kind,struct json_object *body) {
-    struct json_object *a=get(body,"action"),*v=get(body,"value"),*token=get(body,!strcmp(kind,"mixer")?"token":"player");
+    struct json_object *a=json_get(body,"action"),*v=json_get(body,"value"),*token=json_get(body,!strcmp(kind,"mixer")?"token":"player");
     if (!json_object_is_type(a,json_type_string) || !json_object_is_type(token,json_type_string) || json_object_get_string_len(token)>1023 ||
         strlen(json_object_get_string(token))!=(size_t)json_object_get_string_len(token)) return "Invalid control identifier or action";
     const char *action=json_object_get_string(a);
@@ -280,31 +357,33 @@ const char *desktop_action(const char *kind,struct json_object *body) {
             if ((!json_object_is_type(v,json_type_double) && !json_object_is_type(v,json_type_int)) ||
                 !isfinite(json_object_get_double(v)) || json_object_get_double(v)<0 || json_object_get_double(v)>150) return "Volume must be 0–150 percent";
         } else if (!strcmp(action,"mute")) { if (!json_object_is_type(v,json_type_boolean)) return "Mute must be true or false"; }
-        else if (!strcmp(action,"move")) { if (!json_object_is_type(get(body,"target"),json_type_string)) return "Expected a destination"; }
+        else if (!strcmp(action,"move")) { if (!json_object_is_type(json_get(body,"target"),json_type_string)) return "Expected a destination"; }
         else return "Unknown mixer action";
     } else if (strcmp(action,"next") && strcmp(action,"previous") && strcmp(action,"playpause") && strcmp(action,"seek") && strcmp(action,"seek_relative")) return "Unknown player action";
     if (!strcmp(kind,"player") && !strcmp(action,"seek")) {
-        struct json_object *pos=get(body,"position");
+        struct json_object *pos=json_get(body,"position");
         if ((!json_object_is_type(pos,json_type_double) && !json_object_is_type(pos,json_type_int)) ||
             !isfinite(json_object_get_double(pos)) || json_object_get_double(pos)<0 || json_object_get_double(pos)>=1e9) return "Seek position must be a finite number of seconds";
     }
     if (!strcmp(kind,"player") && !strcmp(action,"seek_relative")) {
-        struct json_object *off=get(body,"offset");
+        struct json_object *off=json_get(body,"offset");
         if ((!json_object_is_type(off,json_type_double) && !json_object_is_type(off,json_type_int)) ||
             !isfinite(json_object_get_double(off)) || fabs(json_object_get_double(off))>=1e9) return "Seek offset must be a finite number of seconds";
     }
     pthread_mutex_lock(&d.mutex);
     if (!strcmp(kind,"mixer") && !strcmp(action,"volume")) {
-        for (unsigned i=0;i<d.queued;i++) {
-            if (!strcmp(str(d.queue[i],"kind"),"mixer") && !strcmp(str(d.queue[i],"action"),"volume") &&
-                !strcmp(str(d.queue[i],"token"),json_object_get_string(token))) {
+        for (unsigned n=d.queued;n>0;n--) {
+            unsigned i=n-1;
+            if (!strcmp(json_string(d.queue[i],"kind"),"output")) break;
+            if (!strcmp(json_string(d.queue[i],"kind"),"mixer") && !strcmp(json_string(d.queue[i],"action"),"volume") &&
+                !strcmp(json_string(d.queue[i],"token"),json_object_get_string(token))) {
                 json_object_object_add(d.queue[i],"value",json_object_new_double(json_object_get_double(v)));
                 pthread_mutex_unlock(&d.mutex); return NULL;
             }
         }
     }
     if (d.queued>=32 || !d.started || d.stop) { pthread_mutex_unlock(&d.mutex); return "Desktop controls are busy; try again"; }
-    struct json_object *copy=json_tokener_parse(json_object_to_json_string(body));
+    struct json_object *copy=json_copy(body);
     string(copy,"kind",kind); d.queue[d.queued++]=copy;
     pthread_mutex_unlock(&d.mutex); return NULL;
 }

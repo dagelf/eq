@@ -2,6 +2,7 @@
 #include "eq.h"
 #include "desktop.h"
 #include "library.h"
+#include "json_util.h"
 #include <arpa/inet.h>
 #include <ctype.h>
 #include <errno.h>
@@ -58,6 +59,7 @@ struct app {
     double next_connect, changed_at, apply_deadline, stop_deadline, default_deadline, output_deadline;
     struct settings desired, saved, actual, sent;
     unsigned revision, saved_revision, applied_revision, sent_revision;
+    unsigned master_epoch;
     char state_path[PATH_MAX], config_path[PATH_MAX];
     char persist_error[512], apply_error[512], output_error[512], default_error[512], default_name[NAME_SIZE];
     char instance[64];
@@ -85,6 +87,17 @@ static bool capture_node(uint32_t id) {
             return !strcmp(prop(&o->props->dict,PW_KEY_MEDIA_CLASS),"Stream/Input/Audio");
     return false;
 }
+static const char *select_output(const char *name) {
+    if (strcmp(app.desired.output,name)) {
+        const char *error=desktop_select_output(name,&app.master_epoch);
+        if (error) return error;
+        library_select_output(&app.library,&app.desired,name);
+        if (app.desktop) library_follow(&app.library,app.desktop,&app.desired,true);
+        app.eq_pending=true;
+    }
+    app.output_pending=true;
+    return NULL;
+}
 static void recover_output(void) {
     struct object *current=find_name(app.desired.output),*replacement=NULL;
     if (!app.installed || (current && current->physical)) return;
@@ -94,8 +107,8 @@ static void recover_output(void) {
         replacement=o;
     }
     if (!replacement) return;
-    snprintf(app.desired.output,sizeof(app.desired.output),"%s",replacement->name);
-    app.output_pending=true; app.persist_pending=true; app.changed_at=now(); app.revision++;
+    if (select_output(replacement->name)) return;
+    app.persist_pending=true; app.changed_at=now(); app.revision++;
 }
 static void route_playback(void) {
     if (!app.editing || !app.metadata || strcmp(app.default_name,SINK_NAME)) return;
@@ -311,8 +324,11 @@ static void snapshot(void) {
     add_string(o,"instance",app.instance);
     json_object_object_add(o,"settings",settings_json(&app.desired));
     json_object_object_add(o,"average_gain",json_object_new_double(average_gain(&app.desired)));
+    if (app.desktop) add_bool(app.desktop,"master_ready",json_object_get_boolean(json_get(app.desktop,"master_ready")) &&
+        json_object_get_int64(json_get(app.desktop,"master_epoch"))==app.master_epoch &&
+        !strcmp(json_string(app.desktop,"master_output"),app.desired.output));
     json_object_object_add(o,"desktop",app.desktop?json_object_get(app.desktop):json_object_new_object());
-    json_object_object_add(o,"library",library_snapshot(&app.library));
+    json_object_object_add(o,"library",library_snapshot(&app.library,&app.desired));
     json_object_object_add(o,"saved",settings_json(&app.saved));
     for (int i=0;i<BANDS;i++) json_object_array_add(freq,json_object_new_int(frequencies[i]));
     json_object_object_add(o,"frequencies",freq);
@@ -351,11 +367,13 @@ static void tick(void *data,uint64_t expirations) {
     if (t>=app.next_desktop) {
         if (app.desktop) json_object_put(app.desktop);
         app.desktop=desktop_snapshot();
+        library_volumes(&app.library,json_get(app.desktop,"output_volumes"));
         if (library_follow(&app.library,app.desktop,&app.desired,app.editing)) {
             app.revision++; app.changed_at=t; app.persist_pending=true; app.eq_pending=true;
         }
-        library_save(&app.library); app.next_desktop=t+.5;
+        app.next_desktop=t+.5;
     }
+    library_flush(&app.library,t);
     struct object *sink=find_name(SINK_NAME),*play=find_name(PLAY_NAME);
     if ((app.need_apply || app.eq_pending) && sink && sink->graph && sink->proxy) apply_eq(sink);
     if ((app.need_route || app.output_pending) && play && app.metadata) {
@@ -365,9 +383,13 @@ static void tick(void *data,uint64_t expirations) {
         app.need_route=false; app.output_pending=false;
     }
     if (app.default_pending && app.metadata && sink) {
-        int r=pw_metadata_set_property(app.metadata,PW_ID_CORE,"default.configured.audio.sink","Spa:String","{\"name\":\"" SINK_NAME "\"}");
-        if (r<0) snprintf(app.default_error,sizeof(app.default_error),"Default sink: %s",spa_strerror(r));
-        else app.default_deadline=t+2;
+        app.default_error[0]=0;
+        if (!strcmp(app.default_name,SINK_NAME)) app.default_deadline=0;
+        else {
+            int r=pw_metadata_set_property(app.metadata,PW_ID_CORE,"default.configured.audio.sink","Spa:String","{\"name\":\"" SINK_NAME "\"}");
+            if (r<0) snprintf(app.default_error,sizeof(app.default_error),"Default sink: %s",spa_strerror(r));
+            else app.default_deadline=t+2;
+        }
         app.default_pending=false;
     }
     if (app.apply_deadline>0 && sink && sink->node_state!=PW_NODE_STATE_RUNNING) app.apply_deadline=0;
@@ -453,14 +475,21 @@ static enum MHD_Result handle(void *cls,struct MHD_Connection *c,const char *url
     if (eq) {
         struct settings next=app.desired;
         bool known=true;
-        json_object_object_foreach(body,key,value) { (void)value; if (strcmp(key,"gains") && strcmp(key,"preamp") && strcmp(key,"maintain") && strcmp(key,"loudness_target")) known=false; }
+        json_object_object_foreach(body,key,value) { (void)value; if (strcmp(key,"gains") && strcmp(key,"preamp") && strcmp(key,"maintain") && strcmp(key,"loudness_target") && strcmp(key,"output")) known=false; }
         if (!known || !parse_eq(body,&next)) { code=400; error="Expected ten numeric gains (-12..12), preamp (-24..12), and optional loudness settings"; }
+        else if (json_get(body,"output") && strcmp(json_string(body,"output"),app.desired.output)) { code=409; error="Output changed; these EQ edits belong to another output"; }
         else if (!app.editing) { code=409; error="EQ is disconnected; check setup and selected output"; }
         else { app.desired=next; app.eq_pending=true; library_remember(&app.library,&next); }
     } else if (mixer || player) {
-        error=desktop_action(mixer?"mixer":"player",body); if (error) code=400;
+        if (mixer && json_get(body,"output") && strcmp(json_string(body,"output"),app.desired.output)) { code=409; error="Output changed; adjust its volume again"; }
+        else { error=desktop_action(mixer?"mixer":"player",body); if (error) code=400; }
     } else if (library) {
         error=library_action(&app.library,body,&app.desired); if (error) code=400;
+        /* Resolve recall preferences before accepting another EQ edit, so its
+         * song/device identity and the selected fallback are already current. */
+        if (!error && app.desktop && library_follow(&app.library,app.desktop,&app.desired,app.editing)) {
+            app.revision++; app.changed_at=now(); app.persist_pending=true; app.eq_pending=true;
+        }
     } else if (output) {
         struct json_object *name,*outputs;
         bool valid=json_object_object_length(body)==1 && json_object_object_get_ex(body,"name",&name) && json_object_is_type(name,json_type_string) && valid_name(json_object_get_string(name)) && strlen(json_object_get_string(name))==(size_t)json_object_get_string_len(name);
@@ -470,12 +499,12 @@ static enum MHD_Result handle(void *cls,struct MHD_Connection *c,const char *url
         if (!valid) { code=400; error="Expected a physical output node name"; }
         else if (!found) { code=409; error="Selected physical output is unavailable"; }
         else if (!json_object_get_boolean(cap)) { code=409; error="EQ or WirePlumber is unavailable"; }
-        else { snprintf(app.desired.output,sizeof(app.desired.output),"%s",json_object_get_string(name)); app.output_pending=true; }
+        else { error=select_output(json_object_get_string(name)); if (error) code=503; }
     } else {
         json_object_object_get_ex(live,"can_set_default",&cap);
         if (json_object_object_length(body)) { code=400; error="Expected an empty JSON object"; }
         else if (!json_object_get_boolean(cap)) { code=409; error="Connect the EQ to an output first"; }
-        else { app.default_pending=true; app.default_error[0]=0; }
+        else app.default_pending=true;
     }
     if (!error && (eq || output)) { app.revision++; app.changed_at=now(); app.persist_pending=true; }
     unsigned revision=app.revision;
@@ -643,7 +672,9 @@ int main(int argc,char **argv) {
     pw_loop_add_signal(pw_main_loop_get_loop(app.loop),SIGINT,quit,NULL);
     pw_loop_add_signal(pw_main_loop_get_loop(app.loop),SIGTERM,quit,NULL);
     /* Workers inherit the signal mask installed by the PipeWire loop. */
-    if (desktop_start()) { fputs("Cannot start desktop controls\n",stderr); close(lock); return 1; }
+    library_init_output(&app.library,&app.desired);
+    if (desktop_start(json_get(app.library.data,"output_volumes"))) { fputs("Cannot start desktop controls\n",stderr); close(lock); return 1; }
+    desktop_select_output(app.desired.output,&app.master_epoch);
     app.timer=pw_loop_add_timer(pw_main_loop_get_loop(app.loop),tick,NULL);
     struct timespec interval={0,50000000};
     pw_loop_update_timer(pw_main_loop_get_loop(app.loop),app.timer,&interval,&interval,false);
@@ -662,8 +693,11 @@ int main(int argc,char **argv) {
     if (failed) fprintf(stderr,"Unsaved changes: %s\n",app.persist_error);
     disconnect_pw(); pw_loop_destroy_source(pw_main_loop_get_loop(app.loop),app.timer);
     pw_context_destroy(app.context); pw_main_loop_destroy(app.loop); pw_deinit();
-    desktop_stop(); library_close(&app.library);
+    struct json_object *volumes=desktop_stop();
+    library_volumes(&app.library,volumes); if (volumes) json_object_put(volumes);
+    library_close(&app.library);
     if (*app.library.error) { fprintf(stderr,"%s\n",app.library.error); failed=true; }
+    if (*app.library.log_error) { fprintf(stderr,"%s\n",app.library.log_error); failed=true; }
     if (app.desktop) json_object_put(app.desktop);
     json_object_put(app.snapshot); close(lock); return failed?1:0;
 }

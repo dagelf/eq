@@ -16,6 +16,7 @@ bool eq_same(const struct settings *a, const struct settings *b);
 extern const int frequencies[BANDS];
 bool valid_name(const char *name);
 bool same_bluetooth_output(const char *a, const char *b);
+void output_key(const char *name, char key[NAME_SIZE]);
 bool parse_eq(struct json_object *o, struct settings *s);
 struct json_object *settings_json(const struct settings *s);
 char *render_config(const struct settings *s);

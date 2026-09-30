@@ -71,6 +71,10 @@ button { cursor: pointer; } button:disabled { cursor: default; }
  <progress id="player-progress" max="1" value="0" disabled aria-label="Track progress"></progress>
  <div id="player-time" class="muted"></div>
  <label><input id="remember-song" type="checkbox" checked> Remember EQ for each song</label>
+ <div class="actions"><label><input id="fallback-eq" type="checkbox"> Use best device when this song has no EQ for this output</label><label for="fallback-device">Most similar device</label><select id="fallback-device"><option value="">First saved device with this song</option></select></div>
+ <p class="muted">Tries the selected device’s EQ for the same song, then the first saved device with that song. Otherwise uses this output’s general EQ.</p>
+ <div class="actions"><button id="save-device-eq" disabled>Save as device EQ</button><span id="device-eq-status" class="muted" role="status"></span></div>
+ <details><summary>Saved general EQ for this output</summary><p id="device-eq-values" class="muted"></p></details>
  <label><input id="output-log" type="checkbox" checked> Log songs and EQ to outputlog.txt</label>
  <span id="song-status" class="muted" role="status"></span>
  <p id="player-error" class="error"></p>
@@ -116,6 +120,6 @@ button { cursor: pointer; } button:disabled { cursor: default; }
  <p id="mixer-error" class="error"></p>
  <div id="mixer"></div>
 </details>
-<p class="muted">EQ changes, presets and song settings save automatically. The last applied EQ keeps working when the editor closes.</p>
+<p class="muted">Each output remembers its EQ, master volume and mute. Presets and song settings save automatically. The last applied EQ keeps working when the editor closes.</p>
 <script src="/app.js" defer></script>
 </html>

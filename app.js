@@ -3,7 +3,9 @@ const $ = id => document.getElementById(id);
 const frequencies = ['31 Hz','63 Hz','125 Hz','250 Hz','500 Hz','1 kHz','2 kHz','4 kHz','8 kHz','16 kHz'];
 let settings = {gains: Array(10).fill(0), preamp: 0, maintain: false, loudness_target: 0};
 let dirty = false, sending = false, timer, localError = '', acceptedRevision = 0, outputBusy = false, instance;
+let editSequence = 0, editOutput = '', retryDelay = 500, eqError = '', masterEpoch = 0;
 let latest = null, editing = false, textInvalid = false, presetSignature = '', playerSignature = '', quickbarSignature = '';
+let fallbackSignature = '';
 const pairs = [], mixerRows = new Map(), mixerTimers = new Map(), mixerHold = new Map();
 const average = () => settings.gains.reduce((sum, gain) => sum + gain, 0) / 10;
 const signed = value => `${value >= 0 ? '+' : ''}${value.toFixed(2)}`;
@@ -35,6 +37,7 @@ function displaySettings(forceText = false) {
 }
 function changed() {
   compensate(); displaySettings(); dirty = true;
+  editSequence++; editOutput = latest?.settings.output || ''; retryDelay = 500;
   $('saved').textContent = 'Changes pending…';
   clearTimeout(timer); timer = setTimeout(sendEQ, 70);
 }
@@ -69,7 +72,11 @@ $('reset').addEventListener('click', () => {
 async function mutation(path, body, method = 'PUT') {
   const response = await fetch(path, {method, headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)});
   const result = await response.json();
-  if (!response.ok) throw Error(result.error || `HTTP ${response.status}`);
+  if (!response.ok) {
+    const error = Error(result.error || `HTTP ${response.status}`);
+    error.retryable = response.status >= 500 || (response.status === 409 && result.error?.includes('disconnected'));
+    throw error;
+  }
   acceptedRevision = Math.max(acceptedRevision, result.revision || 0); return result;
 }
 async function action(path, body) {
@@ -79,10 +86,22 @@ async function action(path, body) {
 }
 async function sendEQ() {
   if (sending || !dirty) return;
+  clearTimeout(timer);
+  const sequence = editSequence;
   sending = true; dirty = false;
-  try { await mutation('/api/eq', eqCopy()); localError = ''; }
-  catch (error) { localError = error.message; }
-  finally { sending = false; if (dirty) sendEQ(); else poll(); }
+  let retry = true, delay = 70;
+  try {
+    await mutation('/api/eq', {...eqCopy(), output: editOutput});
+    eqError = ''; retryDelay = 500;
+  } catch (error) {
+    dirty = true; eqError = `EQ changes have not been sent: ${error.message}`;
+    retry = error.retryable !== false || editSequence !== sequence;
+    delay = retryDelay; retryDelay = Math.min(8000, retryDelay * 2);
+  } finally {
+    sending = false;
+    if (dirty && retry) timer = setTimeout(sendEQ, delay);
+    poll();
+  }
 }
 $('output').addEventListener('change', async () => {
   outputBusy = true; $('output').disabled = true;
@@ -98,6 +117,7 @@ $('eq-text').addEventListener('input', () => {
     if (text.startsWith('{') || text.startsWith('[')) value = JSON.parse(text);
     else {
       if (!text) throw Error('Enter EQ values to apply.');
+      if (/^,|,$|,\s*,/.test(text)) throw Error('Enter a number between every comma.');
       value = text.split(/[\s,]+/).map(v => Number(v));
     }
     if (Array.isArray(value)) {
@@ -176,6 +196,14 @@ $('autoload').addEventListener('wheel', event => {
   loadEQ(latest?.library.presets[name], `Loaded “${name}”.`);
 }, {passive:false});
 $('remember-song').addEventListener('change', () => action('/api/library', {action:'remember', enabled:$('remember-song').checked}));
+$('fallback-eq').addEventListener('change', () => action('/api/library', {action:'fallback', enabled:$('fallback-eq').checked}));
+$('fallback-device').addEventListener('change', () => action('/api/library', {action:'fallback_device', device:$('fallback-device').value}));
+$('save-device-eq').addEventListener('click', async () => {
+  try {
+    await mutation('/api/library', {action:'device_eq', output:latest.settings.output, eq:eqCopy()}, 'POST');
+    $('device-eq-status').textContent = 'Saving device EQ…'; poll();
+  } catch (error) { $('device-eq-status').textContent = error.message; }
+});
 $('maintain-load').addEventListener('change', () => action('/api/library', {action:'maintain_load', enabled:$('maintain-load').checked}));
 $('output-log').addEventListener('change', () => action('/api/library', {action:'output_log', enabled:$('output-log').checked}));
 $('player').addEventListener('change', () => action('/api/library', {action:'player', player:$('player').value}));
@@ -222,6 +250,20 @@ function updatePlayer(desktop, library) {
   $('player-time').textContent = player.id ? `${duration(player.position)} / ${duration(player.length)}` : '';
   $('seek-back').disabled = $('seek-forward').disabled = !canSeek;
   $('remember-song').checked = library.remember;
+  $('fallback-eq').checked = library.fallback;
+  $('fallback-device').disabled = !library.fallback || !library.remember;
+  const fallback = JSON.stringify([library.devices, library.fallback_device]);
+  if (fallback !== fallbackSignature) {
+    const options = [new Option('First saved device with this song', '')];
+    for (const name of library.devices || []) options.push(new Option(name, name));
+    if (library.fallback_device && !(library.devices || []).includes(library.fallback_device)) options.push(new Option(`${library.fallback_device} (no longer saved)`, library.fallback_device));
+    $('fallback-device').replaceChildren(...options); $('fallback-device').value = library.fallback_device;
+    fallbackSignature = fallback;
+  }
+  $('save-device-eq').disabled = !editing || dirty || sending;
+  const general = library.device_eq;
+  $('device-eq-values').textContent = general ? general.gains.map((v, i) => `${frequencies[i]}: ${signed(v)} dB`).join(' · ') + ` · Preamp: ${signed(general.preamp)} dB` : 'No general EQ saved yet.';
+  if ($('device-eq-status').textContent.startsWith('Saving') && !library.pending && !library.error) $('device-eq-status').textContent = 'Device EQ saved.';
   $('output-log').checked = library.output_log !== false;
   $('song-status').textContent = library.remember ? library.song_status : 'Song recall off';
   $('player-error').textContent = desktop.player_error || '';
@@ -229,6 +271,7 @@ function updatePlayer(desktop, library) {
 function sendMixer(token, actionName, value) {
   mixerHold.set(token,Date.now()+1800);
   const body = {token,action:actionName,...(actionName === 'move' ? {target:value} : {value})};
+  if (latest?.desktop.mixer.some(item => item.token === token && item.name === 'effect_input.eqweb')) body.output = latest.settings.output;
   const key = `${token}:${actionName}`;
   clearTimeout(mixerTimers.get(key));
   mixerTimers.set(key,setTimeout(() => { mixerTimers.delete(key); action('/api/mixer',body); },actionName === 'volume' ? 70 : 0));
@@ -263,6 +306,8 @@ function makeMixerRow(item) {
 }
 function updateMixer(desktop) {
   const items = desktop.mixer || [], tokens = new Set(items.map(item => item.token));
+  const masterChanged = desktop.master_ready && masterEpoch !== desktop.master_epoch;
+  if (masterChanged) masterEpoch = desktop.master_epoch;
   for (const [token,row] of mixerRows) if (!tokens.has(token)) { row.row.remove(); mixerRows.delete(token); mixerHold.delete(token); }
   for (const group of Object.values(groups)) group.empty.hidden = false;
   for (const item of items) {
@@ -271,11 +316,14 @@ function updateMixer(desktop) {
     if (!mixerRows.has(item.token)) mixerRows.set(item.token,makeMixerRow(item));
     const row = mixerRows.get(item.token), label = [item.application,item.description || item.name].filter(Boolean).join(' · ');
     row.label.textContent = label; row.range.setAttribute('aria-label',`${label} volume percent`); row.number.setAttribute('aria-label',`${label} volume percent, numeric`);
-    row.range.disabled = row.number.disabled = !item.writable;
-    row.mute.disabled = row.route.disabled = false;
+    const masterPending = item.name === 'effect_input.eqweb' && !desktop.master_ready;
+    const restoreMaster = item.name === 'effect_input.eqweb' && masterChanged;
+    if (restoreMaster) mixerHold.delete(item.token);
+    row.range.disabled = row.number.disabled = !item.writable || masterPending;
+    row.mute.disabled = masterPending; row.route.disabled = false;
     row.mute.setAttribute('aria-label',`Mute ${label}`); row.route.setAttribute('aria-label',`Route ${label}`);
     if (!(mixerHold.get(item.token) > Date.now())) {
-      if (document.activeElement !== row.range && document.activeElement !== row.number) row.range.value = row.number.value = Math.round(item.volume);
+      if (restoreMaster || (document.activeElement !== row.range && document.activeElement !== row.number)) row.range.value = row.number.value = Math.round(item.volume);
       row.mute.setAttribute('aria-pressed',String(item.mute));
     }
     const destinations = items.filter(other => other.kind === (item.kind === 'playback' ? 'output' : 'input'));
@@ -284,13 +332,13 @@ function updateMixer(desktop) {
     if (document.activeElement !== row.route && !(mixerHold.get(item.token) > Date.now())) row.route.value = destinations.find(o => o.id === item.route)?.token || '';
   }
   const master = items.find(item => item.kind === 'output' && item.name === 'effect_input.eqweb');
-  $('master-control').disabled = !master?.writable;
+  $('master-control').disabled = !master?.writable || !desktop.master_ready;
   const routed = master && items.some(item => item.kind === 'playback' && item.route === master.id);
-  $('master-help').textContent = !master ? 'EQ volume is unavailable because EQ Web Sink is missing.' : routed ?
+  $('master-help').textContent = !master ? 'EQ volume is unavailable because EQ Web Sink is missing.' : !desktop.master_ready ? 'Restoring volume and mute for this output…' : routed ?
     'EQ volume only affects applications routed to EQ Web Sink. Other application and device volume controls still apply.' :
     'No applications are routed through the EQ. This volume control will not change direct playback. In Playback below, choose EQ Web Sink as the application’s output.';
   if (master && !(mixerHold.get(master.token) > Date.now())) {
-    if (document.activeElement !== $('master') && document.activeElement !== $('master-value')) $('master').value = $('master-value').value = Math.round(master.volume);
+    if (masterChanged || (document.activeElement !== $('master') && document.activeElement !== $('master-value'))) $('master').value = $('master-value').value = Math.round(master.volume);
     $('master-mute').setAttribute('aria-pressed',String(master.mute));
   }
   $('mixer-error').textContent = desktop.mixer_error || '';
@@ -314,12 +362,12 @@ async function poll() {
   try {
     const response = await fetch('/api/state'); if (!response.ok) throw Error(`HTTP ${response.status}`);
     const state = await response.json(); latest = state;
-    if (instance !== state.instance) { instance = state.instance; acceptedRevision = 0; }
+    if (instance !== state.instance) { instance = state.instance; acceptedRevision = 0; masterEpoch = 0; mixerHold.clear(); }
     $('status').textContent = state.live.status;
     editing = state.live.editing; $('editor').disabled = !editing; $('preset-load').disabled = $('autoload').disabled = !editing;
     $('default').disabled = !state.live.can_set_default || state.live.default;
     $('default').textContent = state.live.default ? 'EQ is the default sink' : 'Use EQ as default';
-    $('output').disabled = !state.live.can_select_output || outputBusy;
+    $('output').disabled = !state.live.can_select_output || outputBusy || dirty || sending;
     if (!outputBusy && state.revision >= acceptedRevision) {
       const outputs = [...state.outputs];
       if (!outputs.some(o => o.name === state.settings.output)) outputs.unshift({name:state.settings.output,description:`${state.settings.output} (unavailable)`});
@@ -356,20 +404,20 @@ async function poll() {
     }
     for (const button of $('quickbar').querySelectorAll('[data-quickbar]')) button.disabled = !editing;
     if ($('preset-status').textContent.startsWith('Saving') && !state.library.pending && !state.library.error) $('preset-status').textContent = 'Preset saved.';
-    $('errors').textContent = [localError,state.persistence_error && `Save failed: ${state.persistence_error}`,state.apply_error && `Apply failed: ${state.apply_error}`,state.output_error,state.default_error,state.library.error,state.desktop.action_error].filter(Boolean).join('\n');
+    $('errors').textContent = [eqError,localError,state.persistence_error && `Save failed: ${state.persistence_error}`,state.apply_error && `Apply failed: ${state.apply_error}`,state.output_error,state.default_error,state.library.error,state.library.log_error,state.desktop.action_error,state.desktop.master_error].filter(Boolean).join('\n');
     $('saved').textContent = state.setup_required ? 'Stop the editor and run ./eqweb setup to choose your audio output, then restart PipeWire once.' :
       dirty || sending || state.pending || state.library.pending || state.revision < acceptedRevision ? 'Applying and saving…' :
       state.persistence_error ? 'Settings have not been fully saved.' : state.apply_error ? 'Saved; live apply needs attention.' : state.live.awaiting_readback ? 'Settings saved; waiting for playback to confirm live values.' : 'Settings saved.';
   } catch (error) {
     $('status').textContent = 'Editor disconnected'; $('errors').textContent = error.message; editing = false;
     $('editor').disabled = $('output').disabled = $('default').disabled = $('master-control').disabled = true;
-    for (const id of ['previous','next','playpause','preset-load','seek-back','seek-forward','autoload']) $(id).disabled = true;
+    for (const id of ['previous','next','playpause','preset-load','seek-back','seek-forward','autoload','save-device-eq']) $(id).disabled = true;
     $('player-progress').disabled = true;
     for (const button of $('quickbar').querySelectorAll('[data-quickbar]')) button.disabled = true;
     for (const row of mixerRows.values()) row.range.disabled = row.number.disabled = row.mute.disabled = row.route.disabled = true;
   } finally { polling = false; }
 }
 window.addEventListener('pagehide', () => {
-  if (dirty) fetch('/api/eq', {method:'PUT',keepalive:true,headers:{'Content-Type':'application/json'},body:JSON.stringify(eqCopy())}).catch(() => {});
+  if (dirty) fetch('/api/eq', {method:'PUT',keepalive:true,headers:{'Content-Type':'application/json'},body:JSON.stringify({...eqCopy(),output:editOutput})}).catch(() => {});
 });
 displaySettings(); poll(); setInterval(poll,750);

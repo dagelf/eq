@@ -1,2 +1,6 @@
 /build/
 /eqweb
+/.gocache/
+/codex.sh
+/old/opus-go/eqweb
+__pycache__/

@@ -94,7 +94,7 @@ put output '{"name":"test.output"}'
 await_state '.live.connected and (.pending | not) and .output_error == ""'
 kill "$capture"; wait "$capture" || true; capture=
 echo 'EQ remains editable with a playback meter attached.'
-await_state 'any(.desktop.mixer[]; .name == "effect_input.eqweb")'
+await_state '.desktop.master_ready and any(.desktop.mixer[]; .name == "effect_input.eqweb")'
 post() { curl -fsS -X POST -H 'Content-Type: application/json' -d "$2" "http://127.0.0.1:$EQWEB_PORT/api/$1" >/dev/null; }
 master_token=$(state | jq -r '.desktop.mixer[] | select(.kind == "output" and .name == "effect_input.eqweb") | .token')
 post mixer "$(jq -nc --arg token "$master_token" '{token:$token,action:"volume",value:75}')"
@@ -104,6 +104,54 @@ await_state 'any(.desktop.mixer[]; .name == "effect_input.eqweb" and .mute)'
 post mixer "$(jq -nc --arg token "$master_token" '{token:$token,action:"mute",value:false}')"
 post mixer "$(jq -nc --arg token "$master_token" '{token:$token,action:"volume",value:100}')"
 await_state 'any(.desktop.mixer[]; .name == "effect_input.eqweb" and (.mute | not) and .volume == 100)'
+# General EQ and master controls belong to each selected physical output.
+master() {
+  local token
+  token=$(state | jq -r '.desktop.mixer[] | select(.name == "effect_input.eqweb" and .kind == "output") | .token')
+  post mixer "$(jq -nc --arg token "$token" --arg action "$1" --argjson value "$2" '{token:$token,action:$action,value:$value}')"
+}
+put eq '{"gains":[4,0,0,0,0,0,0,0,0,0],"preamp":-2}'
+master volume 75
+master mute true
+await_state '.desktop.master_ready and any(.desktop.mixer[]; .name == "effect_input.eqweb" and .mute and (.volume-75|fabs)<.01)'
+put output '{"name":"test.other"}'
+await_state '.settings.output == "test.other" and .live.connected and .desktop.master_ready'
+put eq '{"gains":[-5,0,0,0,0,0,0,0,0,0],"preamp":-3}'
+master volume 35
+master mute false
+await_state 'any(.desktop.mixer[]; .name == "effect_input.eqweb" and (.mute|not) and (.volume-35|fabs)<.01)'
+put output '{"name":"test.output"}'
+await_state '.settings.gains[0] == 4 and .settings.preamp == -2 and .desktop.master_ready and any(.desktop.mixer[]; .name == "effect_input.eqweb" and .mute and (.volume-75|fabs)<.01)'
+status=$(curl -sS -o "$temp/stale-eq.json" -w '%{http_code}' -X PUT -H 'Content-Type: application/json' -d '{"gains":[9,0,0,0,0,0,0,0,0,0],"preamp":0,"output":"test.other"}' "http://127.0.0.1:$EQWEB_PORT/api/eq")
+[[ $status == 409 ]]
+# External mixer changes are also remembered. Queued volume precedes a switch.
+pactl set-sink-volume effect_input.eqweb 63%
+pactl set-sink-mute effect_input.eqweb 0
+await_state '(.desktop.output_volumes["test.output"].volume-63|fabs)<.01 and (.desktop.output_volumes["test.output"].mute|not)'
+master volume 66
+put output '{"name":"test.other"}'
+await_state '.desktop.master_ready and .settings.gains[0] == -5 and .settings.preamp == -3 and any(.desktop.mixer[]; .name == "effect_input.eqweb" and (.mute|not) and (.volume-35|fabs)<.01)'
+put output '{"name":"test.output"}'
+put output '{"name":"test.other"}'
+put output '{"name":"test.output"}'
+await_state '.desktop.master_ready and .settings.gains[0] == 4 and any(.desktop.mixer[]; .name == "effect_input.eqweb" and (.mute|not) and (.volume-66|fabs)<.01)'
+kill "$editor"; wait "$editor"; editor=
+pactl set-sink-volume effect_input.eqweb 11%
+pactl set-sink-mute effect_input.eqweb 1
+start_editor
+await_state '.desktop.master_ready and .live.connected and .settings.gains[0] == 4 and .settings.preamp == -2 and any(.desktop.mixer[]; .name == "effect_input.eqweb" and (.mute|not) and (.volume-66|fabs)<.01)'
+put output '{"name":"test.other"}'
+await_state '.desktop.master_ready and .settings.gains[0] == -5 and any(.desktop.mixer[]; .name == "effect_input.eqweb" and (.volume-35|fabs)<.01)'
+# Leave both test outputs flat and at unity for subsequent audio measurements.
+for output in test.other test.output; do
+  put output "$(jq -nc --arg name "$output" '{name:$name}')"
+  await_state ".settings.output == \"$output\" and .live.connected and .desktop.master_ready"
+  put eq '{"gains":[0,0,0,0,0,0,0,0,0,0],"preamp":0}'
+  master volume 100
+  master mute false
+  await_state '(.pending|not) and (.library.pending|not) and any(.desktop.mixer[]; .name == "effect_input.eqweb" and .volume == 100 and (.mute|not))'
+done
+echo 'Per-output EQ, master volume/mute, external mixer edits, queued edits, rapid switching and restart recall passed.'
 pacat --playback --raw --device=effect_input.eqweb --client-name='EQ test playback' < /dev/zero > "$temp/pacat.log" 2>&1 & stream=$!
 parec --raw --device=test.output.monitor --client-name='EQ test recording' > /dev/null 2> "$temp/parec.log" & capture=$!
 await_state 'any(.desktop.mixer[]; .kind == "playback" and .application == "EQ test playback") and any(.desktop.mixer[]; .kind == "recording" and .application == "EQ test recording")'
@@ -121,15 +169,24 @@ post mixer "$(jq -nc --arg token "$playback_token" --arg target "$other_token" '
 await_state "any(.desktop.mixer[]; .token == \"$playback_token\" and .route == $other_id)"
 kill "$stream" "$capture"; wait "$stream" || true; wait "$capture" || true; stream= capture=
 build/test-player > "$temp/player.log" 2>&1 & player=$!
-await_state '.desktop.selected_player.title == "Song A" and .library.song_count == 1'
+await_state '.desktop.selected_player.title == "Song A" and .library.song_count == 0'
 put eq '{"gains":[4,0,0,0,0,0,0,0,0,0],"preamp":0}'
 await_state '.settings.gains[0] == 4 and (.pending | not)'
 post player '{"player":"org.mpris.MediaPlayer2.eqweb_test","action":"next"}'
-await_state '.desktop.selected_player.title == "Song B" and .library.song_count == 2'
+await_state '.desktop.selected_player.title == "Song B" and .library.song_count == 1'
 put eq '{"gains":[-3,0,0,0,0,0,0,0,0,0],"preamp":0}'
 await_state '.settings.gains[0] == -3 and (.pending | not)'
 post player '{"player":"org.mpris.MediaPlayer2.eqweb_test","action":"previous"}'
 await_state '.desktop.selected_player.title == "Song A" and .settings.gains[0] == 4 and (.pending | not)'
+put output '{"name":"test.other"}'
+await_state '.live.connected and .settings.gains[0] == 0'
+put eq '{"gains":[2,0,0,0,0,0,0,0,0,0],"preamp":-1,"output":"test.other"}'
+put output '{"name":"test.output"}'
+await_state '.settings.gains[0] == 4 and .live.connected'
+put output '{"name":"test.other"}'
+await_state '.settings.gains[0] == 2 and .settings.preamp == -1 and .live.connected'
+put output '{"name":"test.output"}'
+await_state '.settings.gains[0] == 4 and .live.connected'
 post player '{"player":"org.mpris.MediaPlayer2.eqweb_test","action":"playpause"}'
 await_state '.desktop.selected_player.status == "Paused"'
 post player '{"player":"org.mpris.MediaPlayer2.eqweb_test","action":"seek","position":90}'
@@ -140,6 +197,29 @@ post player '{"player":"org.mpris.MediaPlayer2.eqweb_test","action":"seek_relati
 await_state '.desktop.selected_player.position == 90 and .desktop.action_error == ""'
 await_state '.library.presets["Test Artist - Song A (Auto)"].gains[0] == 4'
 rg -q 'Song A' "$XDG_STATE_HOME/eqweb/outputlog.txt"
+put output '{"name":"test.other"}'
+await_state '.desktop.master_ready and .live.connected and .settings.gains[0] == 2'
+master volume 71
+master mute true
+await_state 'any(.desktop.mixer[]; .name == "effect_input.eqweb" and .mute and (.volume-71|fabs)<.01)'
+post player '{"player":"org.mpris.MediaPlayer2.eqweb_test","action":"next"}'
+await_state '.desktop.selected_player.title == "Song B" and .settings.gains[0] == 0 and .library.device_eq.gains[0] == 0'
+post library '{"action":"fallback_device","device":"test.output"}'
+post library '{"action":"fallback","enabled":true}'
+await_state '.settings.gains[0] == -3 and (.library.song_status|contains("test.output")) and .library.device_eq.gains[0] == 0 and any(.desktop.mixer[]; .name == "effect_input.eqweb" and .mute and (.volume-71|fabs)<.01)'
+post library '{"action":"fallback_device","device":"saved.but.removed"}'
+await_state '.settings.gains[0] == -3 and .library.fallback_device == "saved.but.removed"'
+post library '{"action":"fallback","enabled":false}'
+await_state '.settings.gains[0] == 0 and any(.desktop.mixer[]; .name == "effect_input.eqweb" and .mute and (.volume-71|fabs)<.01)'
+post library '{"action":"fallback_device","device":"test.output"}'
+master volume 100
+master mute false
+await_state 'any(.desktop.mixer[]; .name == "effect_input.eqweb" and (.mute|not) and .volume == 100)'
+put output '{"name":"test.output"}'
+await_state '.desktop.master_ready and .live.connected and .settings.gains[0] == -3'
+post player '{"player":"org.mpris.MediaPlayer2.eqweb_test","action":"previous"}'
+await_state '.desktop.selected_player.title == "Song A" and .settings.gains[0] == 4'
+echo 'Song fallback: own device, preferred saved device, missing preferred device, general EQ, and independent master volume passed.'
 post library '{"action":"remember","enabled":false}'
 put eq '{"gains":[0,0,0,0,0,0,0,0,0,0],"preamp":0}'
 await_state '.settings.gains[0] == 0 and (.pending | not)'
@@ -182,6 +262,9 @@ if command -v chromium >/dev/null && [[ -x build/browser ]]; then
 fi
 curl -fsS -X POST -H 'Content-Type: application/json' -d '{}' http://127.0.0.1:$EQWEB_PORT/api/default >/dev/null
 await_state '.live.default and .live.connected'
+post default '{}'
+sleep 2.1
+await_state '.live.default and .default_error == ""'
 put output '{"name":"test.output"}'
 await_state '.settings.output == "test.output" and .live.connected and (.pending | not)'
 # Audio measurements are added below; all routes are confined to null devices.
