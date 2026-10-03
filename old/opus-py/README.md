@@ -1,11 +1,13 @@
 # eqweb-py
 
+Archived Python prototype. These historical features and run instructions do not describe the current native C editor. Use the [root README](../../README.md) for the maintained implementation. This prototype shares its configuration path and default port with that editor.
+
 Fresh Python rewrite of the local PipeWire EQ editor.
 
 ## Run
 
 ```bash
-cd new
+cd old/opus-py
 python3 app.py
 ```
 

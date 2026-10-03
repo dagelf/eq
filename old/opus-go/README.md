@@ -1,5 +1,7 @@
 # eqweb
 
+Archived Go prototype. These historical features and run instructions do not describe the current native C editor. Use the [root README](../../README.md) for the maintained implementation. This prototype shares its configuration path and default port with that editor.
+
 `eqweb` is a small local web service that manages a PipeWire equalizer sink.
 
 The audio processing stays inside PipeWire using `libpipewire-module-filter-chain` and builtin biquad filters, which is the low-CPU path. The web app only edits config and writes a generated fragment to:

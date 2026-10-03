@@ -1,5 +1,13 @@
 # Validation results
 
+## Documentation review on 2026-09-30
+
+The active C/JavaScript implementation, headers, build rules and test coverage were reviewed against the documentation. `make test` passed during this review: config, library and isolated HTTP/setup checks. Runtime sources were unchanged, and integration, sanitizer, static-analysis and audio measurements were not rerun for this documentation pass; results below are historical runs.
+
+A temporary C harness linked against the current `library.c` and `config.c` confirmed a limit bypass: a library with 1,000 legacy artist/title-only song entries had 1,001 entries after `library_follow()` recalled one and copied it to an output-specific key. This is a known gap, not a passing limit regression. Source review also found that the integration script skips browser checks without `chromium` on `PATH`, even when `CHROMIUM_BINARY` names an executable. Both are tracked in [TODO.md](TODO.md), alongside refactor and missing-code-documentation work. [SPEC.md](SPEC.md) records the current contracts.
+
+## Recorded implementation validation
+
 Update verified on 2026-09-30: `make test` and the full `make integration` suite passed. Final artifacts and the reviewed browser screenshot are in `/tmp/eqweb-integration-wh8fgb`. AddressSanitizer, UndefinedBehaviorSanitizer and LeakSanitizer passed the library regressions; `cppcheck` reported no warnings and the JavaScript syntax check passed.
 
 New coverage includes independent per-output master volume/mute, external mixer changes, rapid output switches, editor restart, per-output general EQ, per-output/song overrides, preferred-device song fallback, a missing preferred device, and falling back to the saved general EQ. Tests verify that song recall does not alter master volume or overwrite general EQ, borrowed song EQ is not saved as an override until edited, and startup does not replace an existing general EQ. Chromium exercises the fallback checkbox/dropdown, explicit device-EQ saving and display, transient request retries, retention of newer unsent edits, permanent rejection without retry loops, and incomplete comma-separated values. Library tests cover debounced persistence and retained/retried song-log failures; HTTP tests cover the new action validation. A browser regression exposed a preference-change/edit race; recall preferences are now resolved before accepting subsequent edits.
@@ -47,7 +55,7 @@ A shared-clock two-input native probe compared broadband noise at the EQ input m
 
 ## Observed overhead
 
-The editor executable is about 329 KiB with debug information. It dynamically links the installed system libraries; that file size is not its total memory footprint.
+The 2026-09-11 editor executable was about 329 KiB with debug information. That is a historical build measurement, not the current executable size. It dynamically links the installed system libraries; file size is not its total memory footprint. The CPU/RSS and `pw-top` samples below are also from that run.
 
 | Sample | Editor CPU, one core | Editor RSS |
 | --- | ---: | ---: |
@@ -60,6 +68,6 @@ Two noninitial `pw-top` snapshots during playback showed EQ input-node busy time
 
 ## Limits
 
-Physical ALSA/Bluetooth playback and real hardware hotplug were not exercised. Output removal used destruction of a synthetic sink. Tests demonstrate routing policy, signal processing and software timing in isolation; actual device buffering and session-manager policy may differ. The editor does not alter system quantum/rate. Application-stream routing changes only when requested through the mixer. Media integration was tested with a synthetic MPRIS player; metadata quality and supported actions vary by player. Gain compensation uses the arithmetic mean of band gains and does not measure perceptual loudness.
+Physical ALSA/Bluetooth playback and real hardware hotplug were not exercised. Output removal used destruction of a synthetic sink. Tests demonstrate routing policy, signal processing and software timing in isolation; actual device buffering and session-manager policy may differ. The editor does not alter system quantum/rate. While EQ is default and connected for editing, it automatically routes eligible application streams from the selected output through EQ, checking once per stream/default selection and respecting later manual moves. Mixer controls also allow explicit routing. Media integration was tested with a synthetic MPRIS player; metadata quality and supported actions vary by player. Gain compensation uses the arithmetic mean of band gains and does not measure perceptual loudness.
 
 PipeWire 1.6.8's idle filter-graph controls may retain stale parameter readback until activation. That case is handled and tested as “saved; waiting for playback to confirm,” with live readback verified once processing begins.
