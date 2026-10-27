@@ -1,4 +1,28 @@
-# Minimal PipeWire web EQ
+# Graphic equalizer for PipeWire: Linux EQ, mixer and media controls
+
+A ten-band stereo **graphic equalizer** for Linux, with a preamp, presets,
+per-output settings, an application audio mixer, and MPRIS playback controls.
+Fine-tune your speakers, headphones, and audio interfaces from a local browser UI.
+PipeWire owns the filter chain, so the EQ keeps working when you close the editor.
+
+Works alongside Omarchy/Hyprland and other Linux desktops. The editor is native C;
+the interface is plain HTML/JavaScript. No Node server or frontend framework.
+
+Related desktop tools:
+
+- [Vampireslayer: background browser and app idle suspend](https://github.com/dagelf/vampireslayer).
+  Chrome or Firefox eating CPU while you're out for lunch, even when they have
+  nothing to do? Vampire slayer to the rescue. An Omarchy plugin with media exemptions.
+- [Audio pause/cycle hotkeys](https://github.com/dagelf/media-hotkeys): pause all
+  players, cycle one MPRIS source at a time, then return to silence.
+- [Linux utilities](https://github.com/dagelf/utils): the original media-cycle script
+  and other small desktop tools.
+
+Search terms: graphic equalizer, graphical equalizer, equaliser, Linux audio EQ,
+PipeWire, stereo, presets, per-output volume, audio mixer, MPRIS, media controls,
+Omarchy, Hyprland, audio pause, audio cycle, hotkeys.
+
+## Minimal PipeWire web EQ
 
 A native C editor at **http://127.0.0.1:8932**. PipeWire owns the stereo filter chain, so audio processing and the last applied controls continue after the editor exits. HTML and JavaScript are embedded in the executable. No Node, Python, frontend framework, or separate application runtime is used.
 
@@ -143,3 +167,8 @@ Chromium enables native DevTools-driven browser checks. The integration script c
 Integration tests cover per-output EQ and master volume/mute recall, rapid output switching, external mixer changes, editor restart, browser request retries and incomplete text input, stereo Fourier measurements, live parameter readback, rapid updates without sink recreation, editor closure, daemon restart, output loss, output/default selection, persistence failure recovery, keyboard interaction, a sample-delay measurement and CPU/RSS observations. Test artifacts remain in the printed `/tmp/eqweb-integration-*` directory for inspection. See [VALIDATION.md](VALIDATION.md) for measured results and limits.
 
 This implementation uses the documented [PipeWire filter-chain graph and controls](https://docs.pipewire.org/page_module_filter_chain.html), [WirePlumber linking policy](https://pipewire.pages.freedesktop.org/wireplumber/policies/linking.html), [PulseAudio volume API](https://freedesktop.org/software/pulseaudio/doxygen/volume_8h.html), and [MPRIS player interface](https://specifications.freedesktop.org/mpris/latest/Player_Interface.html). Drawing and variable band counts are deferred.
+
+
+## License
+
+[MIT](LICENSE).
