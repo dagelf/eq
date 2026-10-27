@@ -10,9 +10,9 @@ the interface is plain HTML/JavaScript. No Node server or frontend framework.
 
 Related desktop tools:
 
-- [Vampireslayer: background browser and app idle suspend](https://github.com/dagelf/vampireslayer).
+- [Vampire Slayer: background browser and app idle suspend](https://github.com/dagelf/vampireslayer).
   Chrome or Firefox eating CPU while you're out for lunch, even when they have
-  nothing to do? Vampire slayer to the rescue. An Omarchy plugin with media exemptions.
+  nothing to do? Vampire Slayer to the rescue. An Omarchy plugin with media exemptions.
 - [Audio pause/cycle hotkeys](https://github.com/dagelf/media-hotkeys): pause all
   players, cycle one MPRIS source at a time, then return to silence.
 - [Linux utilities](https://github.com/dagelf/utils): the original media-cycle script
