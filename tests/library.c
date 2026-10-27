@@ -21,7 +21,21 @@ static void regressions(void) {
     char dir[]="/tmp/eqweb-regression-XXXXXX",path[512]; assert(mkdtemp(dir));
     snprintf(path,sizeof(path),"%s/settings.json",dir);
     struct library l={0}; assert(!library_open(&l,path));
+    assert(json_object_array_length(get(l.data,"output_priority"))==0);
+    library_prefer_output(&l,"speakers");
+    library_prefer_output(&l,"headphones");
+    library_prefer_output(&l,"speakers");
+    assert(!strcmp(json_object_get_string(json_object_array_get_idx(get(l.data,"output_priority"),0)),"speakers"));
+    assert(json_object_array_length(get(l.data,"output_priority"))==2);
+    library_prefer_output(&l,"bluez_output.AA_BB_CC_DD_EE_FF.1");
+    library_prefer_output(&l,"bluez_output.AA:BB:CC:DD:EE:FF");
+    assert(json_object_array_length(get(l.data,"output_priority"))==3);
+    library_save(&l); library_close(&l); memset(&l,0,sizeof(l));
+    assert(!library_open(&l,path));
+    assert(!strcmp(json_object_get_string(json_object_array_get_idx(get(l.data,"output_priority"),0)),"bluez_output.AA:BB:CC:DD:EE:FF"));
+    assert(!strcmp(json_object_get_string(json_object_array_get_idx(get(l.data,"output_priority"),1)),"speakers"));
     struct settings s={.output="speakers",.preamp=-2}; s.gains[0]=4;
+    action(&l,"{\"action\":\"maintain_load\",\"enabled\":false}",&s);
     struct json_object *track=json("{\"players\":[{\"id\":\"test\",\"title\":\"A\",\"artist\":\"Artist\",\"status\":\"Playing\"}]}");
     library_follow(&l,track,&s,true); library_remember(&l,&s); library_save(&l);
     /* An edit before the next player refresh must not overwrite the old song. */
@@ -50,8 +64,10 @@ static void regressions(void) {
     library_select_output(&l,&s,"speakers");
     library_select_output(&l,&s,"bluez_output.aa:bb:cc:dd:ee:ff"); assert(s.gains[0]==8);
     /* A failed song append survives successful state saves and retries once. */
-    assert(!unlink(l.log_path)); assert(!mkdir(l.log_path,0700));
-    library_follow(&l,track,&s,true); library_save(&l);
+    assert(!mkdir(l.log_path,0700));
+    library_follow(&l,track,&s,true);
+    struct json_object *stopped=json("{\"players\":[]}");
+    library_follow(&l,stopped,&s,true); json_object_put(stopped); library_save(&l);
     assert(!*l.error && *l.log_error && json_object_array_length(l.log_queue)==1);
     library_save(&l); assert(*l.log_error && json_object_array_length(l.log_queue)==1);
     assert(!rmdir(l.log_path)); library_flush(&l,l.save_at+3);
@@ -65,6 +81,7 @@ static void fallback_regressions(void) {
     snprintf(path,sizeof(path),"%s/settings.json",dir);
     struct library l={0}; assert(!library_open(&l,path));
     struct settings s={.output="device.a",.preamp=-3}; s.gains[0]=1;
+    action(&l,"{\"action\":\"maintain_load\",\"enabled\":false}",&s);
     struct json_object *track=json("{\"players\":[{\"id\":\"test\",\"title\":\"Song\",\"artist\":\"Artist\",\"status\":\"Playing\"}]}"),
         *unknown=json("{\"players\":[{\"id\":\"test\",\"title\":\"Unfamiliar\",\"artist\":\"Artist\",\"status\":\"Playing\"}]}");
     library_follow(&l,track,&s,true); s.gains[0]=4; library_remember(&l,&s);
@@ -101,12 +118,112 @@ static void fallback_regressions(void) {
     library_close(&l); json_object_put(track); json_object_put(unknown);
     unlink(l.path); unlink(l.log_path); rmdir(dir);
 }
+static void song_end_regressions(void) {
+    const char *ends[]={
+        "{\"players\":[{\"id\":\"test\",\"title\":\"Song\",\"artist\":\"Artist\",\"status\":\"Stopped\"}]}",
+        "{\"players\":[{\"id\":\"test\",\"title\":\"\",\"status\":\"Playing\"}]}",
+        "{\"players\":[]}",
+        "{\"players\":[{\"id\":\"test\",\"title\":\"Next\",\"artist\":\"Artist\",\"status\":\"Playing\"}]}"
+    };
+    for (size_t i=0;i<sizeof(ends)/sizeof(ends[0]);i++) {
+        char dir[]="/tmp/eqweb-song-end-XXXXXX",path[512]; assert(mkdtemp(dir));
+        snprintf(path,sizeof(path),"%s/settings.json",dir);
+        struct library l={0}; assert(!library_open(&l,path));
+        struct settings s={.output="speakers"};
+        action(&l,"{\"action\":\"maintain_load\",\"enabled\":false}",&s);
+        struct json_object *track=json("{\"players\":[{\"id\":\"test\",\"title\":\"Song\",\"artist\":\"Artist\",\"status\":\"Playing\"}]}"),
+            *paused=json("{\"players\":[{\"id\":\"test\",\"title\":\"Song\",\"artist\":\"Artist\",\"status\":\"Paused\"}]}"),
+            *end=json(ends[i]);
+        /* Untouched songs do not create presets. */
+        assert(!library_follow(&l,track,&s,true));
+        assert(!l.log_queue || !json_object_array_length(l.log_queue));
+        library_follow(&l,end,&s,true);
+        assert(!json_object_object_length(get(l.data,"presets")));
+        library_follow(&l,track,&s,true);
+        /* Even the smallest preamp UI step must be saved. */
+        s.preamp=.01; library_remember(&l,&s);
+        assert(!library_follow(&l,paused,&s,true));
+        assert(!json_object_object_length(get(l.data,"presets")));
+        assert(library_follow(&l,end,&s,true) && s.preamp==0);
+        struct json_object *preset=get(get(l.data,"presets"),"Artist - Song (Auto)");
+        assert(preset && json_object_get_double(get(preset,"preamp"))==.01);
+        struct json_object *entry=json_object_array_get_idx(l.log_queue,json_object_array_length(l.log_queue)-1);
+        assert(!strcmp(json_object_get_string(get(entry,"title")),"Song"));
+        assert(json_object_get_double(get(entry,"preamp"))==.01);
+        library_flush(&l,l.save_at+1);
+        assert(!l.dirty && !*l.error);
+        /* A repeated stopped/missing snapshot must not replace the saved EQ. */
+        library_follow(&l,end,&s,true);
+        assert(!l.dirty);
+        library_close(&l); memset(&l,0,sizeof(l)); assert(!library_open(&l,path));
+        preset=get(get(l.data,"presets"),"Artist - Song (Auto)");
+        assert(preset && json_object_get_double(get(preset,"preamp"))==.01);
+        assert(library_follow(&l,track,&s,true) && s.preamp==.01);
+        char *songs=strdup(json_object_to_json_string(get(l.data,"songs"))),
+            *presets=strdup(json_object_to_json_string(get(l.data,"presets")));
+        action(&l,"{\"action\":\"ignore_custom\",\"enabled\":true}",&s);
+        assert(!json_object_get_boolean(get(l.data,"remember")));
+        assert(library_follow(&l,track,&s,true) && s.preamp==0);
+        s.preamp=-2; library_remember(&l,&s);
+        library_follow(&l,end,&s,true);
+        assert(!strcmp(songs,json_object_to_json_string(get(l.data,"songs"))));
+        assert(!strcmp(presets,json_object_to_json_string(get(l.data,"presets"))));
+        assert(!l.log_queue || !json_object_array_length(l.log_queue));
+        free(songs); free(presets);
+        library_close(&l); memset(&l,0,sizeof(l)); assert(!library_open(&l,path));
+        assert(json_object_get_boolean(get(l.data,"ignore_custom")));
+        assert(!json_object_get_boolean(get(l.data,"remember")));
+        assert(!library_follow(&l,track,&s,true) && s.preamp==-2);
+        action(&l,"{\"action\":\"remember\",\"enabled\":true}",&s);
+        assert(!json_object_get_boolean(get(l.data,"ignore_custom")));
+        assert(library_follow(&l,track,&s,true) && s.preamp==.01);
+        library_close(&l);
+        json_object_put(track); json_object_put(paused); json_object_put(end);
+        unlink(l.path); unlink(l.log_path); rmdir(dir);
+    }
+}
+static void load_loudness_regressions(void) {
+    char dir[]="/tmp/eqweb-load-loudness-XXXXXX",path[512]; assert(mkdtemp(dir));
+    snprintf(path,sizeof(path),"%s/settings.json",dir);
+    struct library l={0}; assert(!library_open(&l,path));
+    struct settings s={.output="speakers",.maintain=true};
+    struct json_object *songs=get(l.data,"songs");
+    json_object_object_add(songs,"[\"speakers\",\"Artist\",\"A\"]",json("{\"gains\":[6,6,6,6,6,6,6,6,6,6],\"preamp\":2,\"maintain\":true,\"loudness_target\":8}"));
+    json_object_object_add(songs,"[\"speakers\",\"Artist\",\"B\"]",json("{\"gains\":[-4,-4,-4,-4,-4,-4,-4,-4,-4,-4],\"preamp\":0,\"maintain\":false}"));
+    struct json_object *a=json("{\"players\":[{\"title\":\"A\",\"artist\":\"Artist\",\"status\":\"Playing\"}]}"),
+        *b=json("{\"players\":[{\"title\":\"B\",\"artist\":\"Artist\",\"status\":\"Playing\"}]}"),
+        *unknown=json("{\"players\":[{\"title\":\"New\",\"status\":\"Playing\"}]}"),
+        *end=json("{\"players\":[]}");
+    assert(library_follow(&l,a,&s,true) && s.preamp==-6 && s.maintain && s.loudness_target==0);
+    assert(library_follow(&l,b,&s,true) && s.preamp==4 && s.maintain && s.loudness_target==0);
+    assert(library_follow(&l,unknown,&s,true) && s.preamp==0 && s.maintain);
+    library_follow(&l,a,&s,true);
+    assert(library_follow(&l,end,&s,true) && s.preamp==0 && s.maintain);
+    /* Compensation works without maintaining subsequent band edits too. */
+    s.maintain=false; s.preamp=-3;
+    assert(library_follow(&l,a,&s,true) && s.preamp==-9 && !s.maintain);
+    assert(library_follow(&l,b,&s,true) && s.preamp==1 && !s.maintain);
+    /* Preserve the requested target through a preamp limit. */
+    s.maintain=true; s.loudness_target=24; s.preamp=12;
+    assert(library_follow(&l,a,&s,true) && s.preamp==12 && s.loudness_target==24);
+    assert(library_follow(&l,b,&s,true) && s.preamp==12 && s.loudness_target==24);
+    action(&l,"{\"action\":\"maintain_load\",\"enabled\":false}",&s);
+    assert(library_follow(&l,a,&s,true) && s.preamp==2 && s.loudness_target==8);
+    /* Loading must not rewrite the saved song to its compensated values. */
+    assert(json_object_get_double(get(get(songs,"[\"speakers\",\"Artist\",\"A\"]"),"preamp"))==2);
+    library_close(&l);
+    json_object_put(a); json_object_put(b); json_object_put(unknown); json_object_put(end);
+    unlink(l.path); unlink(l.log_path); rmdir(dir);
+}
 int main(void) {
+    load_loudness_regressions();
+    song_end_regressions();
     regressions();
     fallback_regressions();
     char dir[]="/tmp/eqweb-library-XXXXXX",path[512]; assert(mkdtemp(dir)); snprintf(path,sizeof(path),"%s/settings.json",dir);
     struct library l={0}; assert(!library_open(&l,path));
     struct settings s={.output="test.output"};
+    action(&l,"{\"action\":\"maintain_load\",\"enabled\":false}",&s);
     struct json_object *a=json("{\"players\":[{\"id\":\"test\",\"title\":\"Song A\",\"artist\":\"Artist\",\"status\":\"Playing\"}]}"),
         *b=json("{\"players\":[{\"id\":\"test\",\"title\":\"Song B\",\"artist\":\"Artist\",\"status\":\"Playing\"}]}"),
         *other=json("{\"players\":[{\"id\":\"test\",\"title\":\"Song A\",\"artist\":\"Someone else\",\"status\":\"Playing\"}]}");
@@ -142,6 +259,7 @@ int main(void) {
 
     unlink(l.path); unlink(log_path); memset(&l,0,sizeof(l)); assert(!library_open(&l,path));
     struct settings speakers={.output="speakers"},phones={.output="headphones"};
+    action(&l,"{\"action\":\"maintain_load\",\"enabled\":false}",&speakers);
     speakers.gains[0]=4; phones.gains[0]=-5;
     assert(!library_follow(&l,a,&speakers,true)); library_remember(&l,&speakers);
     assert(!library_follow(&l,a,&phones,true)); library_remember(&l,&phones);

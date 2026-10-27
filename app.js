@@ -103,12 +103,14 @@ async function sendEQ() {
     poll();
   }
 }
-$('output').addEventListener('change', async () => {
-  outputBusy = true; $('output').disabled = true;
+async function selectOutput() {
+  outputBusy = true; $('output').disabled = $('prefer-output').disabled = true;
   try { await mutation('/api/output', {name: $('output').value}); localError = ''; }
   catch (error) { localError = error.message; }
   finally { outputBusy = false; poll(); }
-});
+}
+$('output').addEventListener('change', selectOutput);
+$('prefer-output').addEventListener('click', selectOutput);
 $('default').addEventListener('click', () => { $('default').disabled = true; action('/api/default', {}); });
 $('eq-text').addEventListener('input', () => {
   try {
@@ -148,9 +150,10 @@ function loadEQ(eq, status) {
   if (!eq || !editing) return;
   let next = normalize(eq);
   if ($('maintain-load').checked) {
-    const target = average() + settings.preamp, mean = next.gains.reduce((sum, gain) => sum + gain, 0) / 10;
+    const target = settings.maintain ? settings.loudness_target : average() + settings.preamp, mean = next.gains.reduce((sum, gain) => sum + gain, 0) / 10;
+    next.maintain = settings.maintain;
     next.preamp = Math.max(-24, Math.min(12, target - mean));
-    next.loudness_target = next.maintain ? Math.max(-36, Math.min(24, target)) : mean + next.preamp;
+    next.loudness_target = target;
   }
   settings = next; textInvalid = false; $('text-error').textContent = ''; $('eq-text').removeAttribute('aria-invalid');
   changed(); displaySettings(true); if (status) $('preset-status').textContent = status;
@@ -196,6 +199,7 @@ $('autoload').addEventListener('wheel', event => {
   loadEQ(latest?.library.presets[name], `Loaded “${name}”.`);
 }, {passive:false});
 $('remember-song').addEventListener('change', () => action('/api/library', {action:'remember', enabled:$('remember-song').checked}));
+$('ignore-custom').addEventListener('change', () => action('/api/library', {action:'ignore_custom', enabled:$('ignore-custom').checked}));
 $('fallback-eq').addEventListener('change', () => action('/api/library', {action:'fallback', enabled:$('fallback-eq').checked}));
 $('fallback-device').addEventListener('change', () => action('/api/library', {action:'fallback_device', device:$('fallback-device').value}));
 $('save-device-eq').addEventListener('click', async () => {
@@ -250,6 +254,7 @@ function updatePlayer(desktop, library) {
   $('player-time').textContent = player.id ? `${duration(player.position)} / ${duration(player.length)}` : '';
   $('seek-back').disabled = $('seek-forward').disabled = !canSeek;
   $('remember-song').checked = library.remember;
+  $('ignore-custom').checked = library.ignore_custom;
   $('fallback-eq').checked = library.fallback;
   $('fallback-device').disabled = !library.fallback || !library.remember;
   const fallback = JSON.stringify([library.devices, library.fallback_device]);
@@ -368,6 +373,8 @@ async function poll() {
     $('default').disabled = !state.live.can_set_default || state.live.default;
     $('default').textContent = state.live.default ? 'EQ is the default sink' : 'Use EQ as default';
     $('output').disabled = !state.live.can_select_output || outputBusy || dirty || sending;
+    $('prefer-output').disabled = $('output').disabled || !state.live.output_present ||
+      state.library.output_priority?.[0] === state.settings.output;
     if (!outputBusy && state.revision >= acceptedRevision) {
       const outputs = [...state.outputs];
       if (!outputs.some(o => o.name === state.settings.output)) outputs.unshift({name:state.settings.output,description:`${state.settings.output} (unavailable)`});
@@ -410,7 +417,7 @@ async function poll() {
       state.persistence_error ? 'Settings have not been fully saved.' : state.apply_error ? 'Saved; live apply needs attention.' : state.live.awaiting_readback ? 'Settings saved; waiting for playback to confirm live values.' : 'Settings saved.';
   } catch (error) {
     $('status').textContent = 'Editor disconnected'; $('errors').textContent = error.message; editing = false;
-    $('editor').disabled = $('output').disabled = $('default').disabled = $('master-control').disabled = true;
+    $('editor').disabled = $('output').disabled = $('prefer-output').disabled = $('default').disabled = $('master-control').disabled = true;
     for (const id of ['previous','next','playpause','preset-load','seek-back','seek-forward','autoload','save-device-eq']) $(id).disabled = true;
     $('player-progress').disabled = true;
     for (const button of $('quickbar').querySelectorAll('[data-quickbar]')) button.disabled = true;

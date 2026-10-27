@@ -17,6 +17,7 @@ const char *library_action(struct library *l,struct json_object *body,const stru
 void library_remember(struct library *l,const struct settings *current);
 void library_remember_output(struct library *l,const struct settings *current);
 void library_init_output(struct library *l,const struct settings *current);
+void library_prefer_output(struct library *l,const char *output);
 void library_select_output(struct library *l,struct settings *current,const char *output);
 void library_volumes(struct library *l,struct json_object *volumes);
 bool library_follow(struct library *l,struct json_object *desktop,struct settings *current,bool editing);

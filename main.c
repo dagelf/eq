@@ -55,6 +55,7 @@ struct app {
     bool broken, need_apply, need_route, default_pending, installed, editing, pw_connected;
     bool persist_pending, eq_pending, output_pending, readback, awaiting_readback;
     bool stopping;
+    bool outputs_changed;
     int param_seq, expected_seq, stop_seq;
     double next_connect, changed_at, apply_deadline, stop_deadline, default_deadline, output_deadline;
     struct settings desired, saved, actual, sent;
@@ -99,15 +100,26 @@ static const char *select_output(const char *name) {
     return NULL;
 }
 static void recover_output(void) {
-    struct object *current=find_name(app.desired.output),*replacement=NULL;
-    if (!app.installed || (current && current->physical)) return;
-    for (struct object *o=app.objects;o;o=o->next) {
-        if (!o->physical || !same_bluetooth_output(app.desired.output,o->name)) continue;
-        if (replacement) return; /* Multiple endpoints: let the user choose. */
-        replacement=o;
+    if (!app.installed || !app.pw_connected || !app.outputs_changed) return;
+    struct object *replacement=NULL;
+    struct json_object *priority=json_get(app.library.data,"output_priority");
+    for (size_t i=0;i<json_object_array_length(priority);i++) {
+        const char *name=json_object_get_string(json_object_array_get_idx(priority,i));
+        replacement=find_name(name);
+        if (replacement && replacement->physical) break;
+        replacement=NULL;
+        bool ambiguous=false;
+        for (struct object *o=app.objects;o;o=o->next) {
+            if (!o->physical || !same_bluetooth_output(name,o->name)) continue;
+            if (replacement) { ambiguous=true; break; }
+            replacement=o;
+        }
+        if (!ambiguous && replacement) break;
+        replacement=NULL;
     }
-    if (!replacement) return;
-    if (select_output(replacement->name)) return;
+    app.outputs_changed=false;
+    if (!replacement || !strcmp(replacement->name,app.desired.output)) return;
+    if (select_output(replacement->name)) { app.outputs_changed=true; return; }
     app.persist_pending=true; app.changed_at=now(); app.revision++;
 }
 static void route_playback(void) {
@@ -149,6 +161,7 @@ static void node_info(void *data,const struct pw_node_info *info) {
         o->physical=physical_output(props,o->name);
         if (o->sink && o->graph && !was_graph) app.need_apply=true;
         if (o->physical && !was_physical) app.need_route=true;
+        if (o->physical!=was_physical) app.outputs_changed=true;
     }
     if (o->sink && (info->change_mask & PW_NODE_CHANGE_MASK_PARAMS))
         pw_node_enum_params(o->proxy,++app.param_seq,SPA_PARAM_Props,0,UINT32_MAX,NULL);
@@ -223,6 +236,7 @@ static void registry_global(void *data,uint32_t id,uint32_t permissions,const ch
         if (o->proxy) pw_node_add_listener(o->proxy,&o->listener,&node_events,o);
         if (o->sink) { app.need_apply=true; app.readback=false; }
         if (o->playback || o->physical) app.need_route=true;
+        if (o->physical) app.outputs_changed=true;
     } else {
         o->proxy=pw_registry_bind(app.registry,id,type,PW_VERSION_LINK,0);
         if (o->proxy) pw_link_add_listener(o->proxy,&o->listener,&link_events,o);
@@ -236,6 +250,7 @@ static void registry_remove(void *data,uint32_t id) {
     }
     for (struct object **p=&app.objects;*p;p=&(*p)->next) if ((*p)->id==id) {
         struct object *o=*p; *p=o->next;
+        if (o->physical) app.outputs_changed=true;
         if (o->sink) app.readback=false;
         if (o->proxy) { spa_hook_remove(&o->listener); pw_proxy_destroy(o->proxy); }
         if (o->props) pw_properties_free(o->props);
@@ -499,7 +514,11 @@ static enum MHD_Result handle(void *cls,struct MHD_Connection *c,const char *url
         if (!valid) { code=400; error="Expected a physical output node name"; }
         else if (!found) { code=409; error="Selected physical output is unavailable"; }
         else if (!json_object_get_boolean(cap)) { code=409; error="EQ or WirePlumber is unavailable"; }
-        else { error=select_output(json_object_get_string(name)); if (error) code=503; }
+        else {
+            error=select_output(json_object_get_string(name));
+            if (error) code=503;
+            else library_prefer_output(&app.library,json_object_get_string(name));
+        }
     } else {
         json_object_object_get_ex(live,"can_set_default",&cap);
         if (json_object_object_length(body)) { code=400; error="Expected an empty JSON object"; }
@@ -653,16 +672,21 @@ int main(int argc,char **argv) {
     if (atomic_write(init_path,"",0)) { perror("Create state directory"); return 1; } unlink(init_path);
     int lock=open(lock_path,O_CREAT|O_RDWR|O_CLOEXEC,0600);
     if (lock<0 || flock(lock,LOCK_EX|LOCK_NB)) { fputs("Another eqweb process is running or the state lock is unavailable\n",stderr); return 1; }
+    if (library_open(&app.library,app.state_path)) { perror("Load presets and song EQ"); close(lock); return 1; }
     if (setup) {
         if (choose && choose_output(false)) { close(lock); return 1; }
         char backup[PATH_MAX]; int r=backup_config(app.config_path,backup,sizeof(backup));
         if (r<0) { perror("Back up existing configuration"); return 1; }
         if (r) printf("Backup: %s\n",backup);
         if (save_settings(app.state_path,&app.desired) || save_config(app.config_path,&app.desired)) { perror("Install configuration"); return 1; }
+        library_prefer_output(&app.library,app.desired.output);
+        library_save(&app.library);
+        if (app.library.dirty) { fprintf(stderr,"Save output priority: %s\n",app.library.error); return 1; }
         printf("Installed: %s\nRestart desktop audio once to load the graph:\n  command systemctl --user restart pipewire pipewire-pulse wireplumber\nRun as your normal user; 'command' bypasses shell aliases that might add sudo.\nThis interrupts current playback. Ordinary EQ adjustments require no restart.\n",app.config_path); close(lock); return 0;
     }
     app.installed=installed_config(app.config_path);
-    if (library_open(&app.library,app.state_path)) { perror("Load presets and song EQ"); close(lock); return 1; }
+    if (!json_object_array_length(json_get(app.library.data,"output_priority")))
+        library_prefer_output(&app.library,app.desired.output);
     if (app.installed && loaded) { app.persist_pending=true; app.changed_at=now()-1; }
     pw_init(NULL,NULL);
     app.loop=pw_main_loop_new(NULL);

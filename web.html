@@ -71,6 +71,7 @@ button { cursor: pointer; } button:disabled { cursor: default; }
  <progress id="player-progress" max="1" value="0" disabled aria-label="Track progress"></progress>
  <div id="player-time" class="muted"></div>
  <label><input id="remember-song" type="checkbox" checked> Remember EQ for each song</label>
+ <label><input id="ignore-custom" type="checkbox"> Ignore custom presets (disable song EQ saving and loading)</label>
  <div class="actions"><label><input id="fallback-eq" type="checkbox"> Use best device when this song has no EQ for this output</label><label for="fallback-device">Most similar device</label><select id="fallback-device"><option value="">First saved device with this song</option></select></div>
  <p class="muted">Tries the selected device’s EQ for the same song, then the first saved device with that song. Otherwise uses this output’s general EQ.</p>
  <div class="actions"><button id="save-device-eq" disabled>Save as device EQ</button><span id="device-eq-status" class="muted" role="status"></span></div>
@@ -111,8 +112,9 @@ button { cursor: pointer; } button:disabled { cursor: default; }
 </fieldset>
 <fieldset>
  <legend>Output</legend>
- <div class="actions"><label for="output">Physical output</label><select id="output" disabled><option>Loading…</option></select><button id="default" disabled>Use EQ as default</button></div>
- <p class="muted">Choose where the EQ sends audio. Output changes and Bluetooth reconnection need no audio restart. When EQ is the default, applications using this device are routed through it automatically. Later manual routing changes are respected.</p>
+ <div class="actions"><label for="output">Physical output</label><select id="output" disabled><option>Loading…</option></select><button id="prefer-output" disabled>Prefer this output</button><button id="default" disabled>Use EQ as default</button></div>
+ <p class="muted">Each selection becomes your first choice. If it disconnects, EQ uses your next available previous choice, then switches back when a preferred device reconnects. Prefer this output makes the current fallback your first choice. This order is saved and automatic switching runs while the editor is open. No audio restart is needed.</p>
+ <p class="muted">When EQ is the default, applications using this device are routed through it automatically. Later manual routing changes are respected.</p>
 </fieldset>
 <details id="mixer-panel" open>
  <summary>Audio mixer</summary>

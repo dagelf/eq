@@ -1,5 +1,21 @@
 # Validation results
 
+## Load loudness preservation on 2026-10-21
+
+`make test` and full `make integration` passed. Artifacts: `/tmp/eqweb-integration-DLo5BI`. Library regressions verify 0 dB and nonzero targets across song recall and general-EQ fallback, preservation of the continuous-maintain checkbox and requested target through preamp limits, exact saved-EQ restoration when disabled, and unchanged saved song values. Chromium verifies a 0 dB With preamp value through preset loading and two automatic song transitions. Existing exact-preamp recall tests now explicitly disable load compensation. Stereo flat/boosted measurements, editor shutdown/restart, device priority, routing and Bluetooth simulations passed. The earlier capture failures recorded below did not recur in this run.
+
+## Song-end saving and ignore toggle on 2026-10-21
+
+`make test` passed. New library regressions cover stopped playback, missing player/title, next-song transitions, no writes on song start, final-EQ logging, pause retention, small preamp edits, repeated ended snapshots, restart persistence, and ignore/remember interaction. HTTP checks reject invalid ignore preferences. Chromium passed the new checkbox interaction checks in `/tmp/eqweb-integration-Tp1bcW` and `/tmp/eqweb-integration-ksccJd`; an existing device-EQ display assertion now waits for the page refresh.
+
+Full integration did not pass: one run measured the flat capture at −3.187 dB; the repeat measured flat correctly and latency at 256 frames, then measured the boosted capture at −0.192 dB instead of +3 dB. The amplitude tolerances were retained. Functional audio, device, song recall and browser checks passed before these failures; later integration checks were not reached. These capture failures remain unresolved.
+
+## Output priority update on 2026-10-03
+
+`make test` and full `make integration` passed with the final rebuilt editor, including Chromium browser checks. Artifacts: `/tmp/eqweb-integration-qq3wrn`.
+
+New library checks cover selection-order promotion, Bluetooth address deduplication and priority persistence. Isolated PipeWire tests cover cascading fallback through previous selections, waiting when all preferred outputs are absent despite an unrelated available output, return of a preferred Bluetooth device under a changed endpoint name, skipping ambiguous Bluetooth matches, explicit promotion of an older choice, and editor restart while preferred devices are missing or connected. Existing device EQ/master restoration, audio-server restart, routing and stereo audio measurements also passed. Bluetooth/hotplug behavior was simulated with synthetic sinks; real hardware was not disconnected.
+
 ## Documentation review on 2026-09-30
 
 The active C/JavaScript implementation, headers, build rules and test coverage were reviewed against the documentation. `make test` passed during this review: config, library and isolated HTTP/setup checks. Runtime sources were unchanged, and integration, sanitizer, static-analysis and audio measurements were not rerun for this documentation pass; results below are historical runs.

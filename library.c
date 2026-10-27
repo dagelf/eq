@@ -91,6 +91,16 @@ static struct json_object *song_for_output(struct library *l,const char *output,
 }
 static int ensure_fields(struct library *l) {
     bool added=false;
+    struct json_object *priority=json_get(l->data,"output_priority");
+    if (!priority) { json_object_object_add(l->data,"output_priority",json_object_new_array()); added=true; }
+    else {
+        if (!json_object_is_type(priority,json_type_array)) return -1;
+        for (size_t i=0;i<json_object_array_length(priority);i++) {
+            struct json_object *name=json_object_array_get_idx(priority,i);
+            if (!json_object_is_type(name,json_type_string) || !valid_name(json_object_get_string(name)) ||
+                strlen(json_object_get_string(name))!=(size_t)json_object_get_string_len(name)) return -1;
+        }
+    }
     const char *maps[]={"output_eq","output_volumes"};
     for (size_t i=0;i<2;i++) {
         struct json_object *map=json_get(l->data,maps[i]);
@@ -121,6 +131,10 @@ static int ensure_fields(struct library *l) {
     v=json_get(l->data,"output_log");
     if (!v) { json_object_object_add(l->data,"output_log",json_object_new_boolean(1)); added=true; }
     else if (!json_object_is_type(v,json_type_boolean)) return -1;
+    v=json_get(l->data,"ignore_custom");
+    if (!v) { json_object_object_add(l->data,"ignore_custom",json_object_new_boolean(false)); added=true; }
+    else if (!json_object_is_type(v,json_type_boolean)) return -1;
+    if (json_object_get_boolean(v)) json_object_object_add(l->data,"remember",json_object_new_boolean(false));
     v=json_get(l->data,"fallback");
     if (!v) { json_object_object_add(l->data,"fallback",json_object_new_boolean(false)); added=true; }
     else if (!json_object_is_type(v,json_type_boolean)) return -1;
@@ -183,18 +197,31 @@ static struct json_object *device_eq(struct library *l,const struct settings *cu
     char key[NAME_SIZE]; output_key(current->output,key);
     return json_get(json_get(l->data,"output_eq"),key);
 }
-static bool restore_general(struct library *l,struct settings *current) {
+static bool load_eq(struct library *l,struct json_object *eq,struct settings *current,bool loading) {
+    struct settings next=*current;
+    if (!parse_eq(eq,&next)) return false;
+    if (loading && json_object_get_boolean(json_get(l->data,"maintain_load"))) {
+        double target=current->maintain?current->loudness_target:average_gain(current)+current->preamp;
+        next.maintain=current->maintain;
+        next.loudness_target=target;
+        next.preamp=fmax(-24,fmin(12,target-average_gain(&next)));
+    }
+    *current=next; return true;
+}
+static bool restore_general(struct library *l,struct settings *current,bool loading) {
     struct settings before=*current;
-    if (!parse_eq(device_eq(l,current),current)) return false;
+    if (!load_eq(l,device_eq(l,current),current,loading)) return false;
     if (before.preamp!=current->preamp || before.maintain!=current->maintain || before.loudness_target!=current->loudness_target) return true;
     for (int i=0;i<BANDS;i++) if (before.gains[i]!=current->gains[i]) return true;
     return false;
 }
 struct json_object *library_snapshot(struct library *l,const struct settings *current) {
     struct json_object *o=json_object_new_object();
+    json_object_object_add(o,"output_priority",json_object_get(json_get(l->data,"output_priority")));
     json_object_object_add(o,"presets",json_object_get(json_get(l->data,"presets")));
     json_object_object_add(o,"quickbar",json_object_get(json_get(l->data,"quickbar")));
     json_object_object_add(o,"remember",json_object_get(json_get(l->data,"remember")));
+    json_object_object_add(o,"ignore_custom",json_object_get(json_get(l->data,"ignore_custom")));
     json_object_object_add(o,"maintain_load",json_object_get(json_get(l->data,"maintain_load")));
     json_object_object_add(o,"output_log",json_object_get(json_get(l->data,"output_log")));
     json_object_object_add(o,"player",json_object_get(json_get(l->data,"player")));
@@ -227,7 +254,16 @@ const char *library_action(struct library *l,struct json_object *body,const stru
         } else json_object_object_del(presets,name);
     } else if (!strcmp(action,"remember")) {
         const char *error=toggle(l,body,"remember"); if (error) return error;
+        if (json_object_get_boolean(json_get(l->data,"remember")))
+            json_object_object_add(l->data,"ignore_custom",json_object_new_boolean(false));
         l->general_pending=!json_object_get_boolean(json_get(l->data,"remember"));
+        l->song[0]=0; l->song_status[0]=0; l->baseline_valid=false;
+    } else if (!strcmp(action,"ignore_custom")) {
+        const char *error=toggle(l,body,"ignore_custom"); if (error) return error;
+        if (json_object_get_boolean(json_get(l->data,"ignore_custom"))) {
+            json_object_object_add(l->data,"remember",json_object_new_boolean(false));
+            l->general_pending=true;
+        }
         l->song[0]=0; l->song_status[0]=0; l->baseline_valid=false;
     } else if (!strcmp(action,"maintain_load")) {
         const char *error=toggle(l,body,"maintain_load"); if (error) return error;
@@ -277,6 +313,19 @@ void library_remember(struct library *l,const struct settings *current) {
 void library_init_output(struct library *l,const struct settings *current) {
     if (!device_eq(l,current)) library_remember_output(l,current);
 }
+void library_prefer_output(struct library *l,const char *output) {
+    if (!valid_name(output) || !strcmp(output,"eqweb.unselected")) return;
+    struct json_object *old=json_get(l->data,"output_priority"),*priority=json_object_new_array();
+    json_object_array_add(priority,json_object_new_string(output));
+    for (size_t i=0;i<json_object_array_length(old);i++) {
+        struct json_object *entry=json_object_array_get_idx(old,i);
+        const char *name=json_object_get_string(entry);
+        if (strcmp(output,name) && !same_bluetooth_output(output,name))
+            json_object_array_add(priority,json_object_get(entry));
+    }
+    if (json_object_equal(old,priority)) { json_object_put(priority); return; }
+    json_object_object_add(l->data,"output_priority",priority); mark_dirty(l);
+}
 void library_remember_output(struct library *l,const struct settings *current) {
     char key[NAME_SIZE]; output_key(current->output,key);
     struct json_object *outputs=json_get(l->data,"output_eq"),*eq=eq_json(current);
@@ -287,7 +336,7 @@ void library_remember_output(struct library *l,const struct settings *current) {
 void library_select_output(struct library *l,struct settings *current,const char *output) {
     if (!strcmp(current->output,output)) return;
     library_init_output(l,current);
-    restore_general(l,current);
+    restore_general(l,current,false);
     char key[NAME_SIZE]; output_key(output,key);
     snprintf(current->output,sizeof(current->output),"%s",output);
     struct json_object *saved=json_get(json_get(l->data,"output_eq"),key);
@@ -331,6 +380,14 @@ static void log_song(struct library *l,const struct settings *current,const char
         json_object_put(o); return;
     }
     json_object_array_add(l->log_queue,o);
+}
+static void finish_song(struct library *l,const struct settings *current) {
+    if (!*l->song || strcmp(l->song_output,current->output) ||
+        json_object_get_boolean(json_get(l->data,"ignore_custom"))) return;
+    if (l->baseline_valid && !eq_same(current,&l->baseline)) save_auto_preset(l,current);
+    struct json_object *keep=NULL; const char *artist,*title;
+    if (track_parts(l->song,&artist,&title,&keep)) log_song(l,current,artist,title);
+    if (keep) json_object_put(keep);
 }
 /* Roll back an incomplete append before retrying it. The editor's process lock
  * ensures that only one eqweb process writes this log. */
@@ -376,20 +433,21 @@ bool library_follow(struct library *l,struct json_object *desktop,struct setting
     json_object_object_add(desktop,"selected_player",selected?json_object_get(selected):json_object_new_object());
     if (!editing) return false;
     library_init_output(l,current);
-    bool restored=l->general_pending && restore_general(l,current);
+    bool restored=l->general_pending && restore_general(l,current,true);
     l->general_pending=false;
     if (!selected || !*json_string(selected,"title") || !strcmp(json_string(selected,"status"),"Stopped")) {
-        if (*l->song && json_object_get_boolean(json_get(l->data,"remember"))) restored=restore_general(l,current) || restored;
+        finish_song(l,current);
+        if (*l->song && json_object_get_boolean(json_get(l->data,"remember"))) restored=restore_general(l,current,true) || restored;
         l->song[0]=0; l->baseline_valid=false; snprintf(l->song_status,sizeof(l->song_status),"Using the device EQ; waiting for a song title"); return restored;
     }
     const char *artist=json_string(selected,"artist"),*title=json_string(selected,"title");
     char keyed[2048],device[NAME_SIZE]; output_key(current->output,device);
     if (!make_key(keyed,sizeof(keyed),device,artist,title)) { l->song[0]=0; l->baseline_valid=false; return restored; }
     if (!strcmp(l->song,keyed)) return restored;
-    if (*l->song && l->baseline_valid && !eq_same(current,&l->baseline)) {
+    if (*l->song) {
         struct json_object *keep=NULL; const char *prev_artist,*prev_title;
         if (track_parts(l->song,&prev_artist,&prev_title,&keep) && (strcmp(prev_artist,artist) || strcmp(prev_title,title)))
-            save_auto_preset(l,current);
+            finish_song(l,current);
         if (keep) json_object_put(keep);
     }
     snprintf(l->song,sizeof(l->song),"%s",keyed);
@@ -409,16 +467,16 @@ bool library_follow(struct library *l,struct json_object *desktop,struct setting
                 saved=song_for_output(l,candidate,artist,title); if (saved) source=candidate;
             }
         }
-        if (saved && parse_eq(saved,current)) {
-            if (!source && !json_get(songs,keyed)) { json_object_object_add(songs,keyed,eq_json(current)); mark_dirty(l); }
+        if (saved && load_eq(l,saved,current,true)) {
+            if (!source && !json_get(songs,keyed)) { json_object_object_add(songs,keyed,json_copy(saved)); mark_dirty(l); }
             if (source) snprintf(l->song_status,sizeof(l->song_status),"Using this song’s EQ from %s",source);
             else snprintf(l->song_status,sizeof(l->song_status),"Restored this song’s EQ");
             restored=true;
         } else {
-            restored=restore_general(l,current) || restored;
+            restored=restore_general(l,current,true) || restored;
             snprintf(l->song_status,sizeof(l->song_status),"No saved song EQ; using the device EQ");
         }
         l->baseline=*current; l->baseline_valid=true;
     } else { l->baseline_valid=false; snprintf(l->song_status,sizeof(l->song_status),"Song recall off"); }
-    log_song(l,current,artist,title); return restored;
+    return restored;
 }

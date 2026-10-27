@@ -14,7 +14,7 @@ Reviewed the active native C/JavaScript implementation on 2026-09-30. The archiv
 - [ ] **P1 — Separate recall decisions from library side effects.** `library_follow()` chooses a player, resolves song/general/fallback EQ, migrates legacy keys, creates auto presets, logs transitions and changes the supplied desktop JSON. Extract a recall selector with an explicit result/source, followed by a transition handler for persistence/logging. Preserve own-song → legacy → preferred-device → sorted-other-device → general precedence, and the rule that borrowed EQ is not stored until edited.
 - [ ] **P2 — Separate browser request state from rendering.** `app.js` mixes listeners, EQ retry state, polling, library controls and mixer/player DOM updates. Extract the EQ request coordinator and focused render functions first, keeping embedded static assets and the runtime-free build. Preserve `editSequence`, `editOutput`, process-instance resets, permanent-error behavior and invalid text. Use existing browser retry, newer-edit and incomplete-input regressions as the acceptance checks.
 - [ ] **P2 — Isolate mixer and player adapters inside the desktop worker.** `desktop.c` combines command validation, libpulse operations, MPRIS polling and master restoration. Synchronous `GetAll` calls for up to 16 players share a worker with mixer/output commands, so slow players can delay volume restoration. Extract adapter boundaries and measure a slow-player fixture before choosing asynchronous calls or another worker. Preserve command order, volume coalescing barriers, token generations and master epochs.
-- [ ] **P2 — Make EQ policy duplication and comparisons explicit.** `config.c`, `app.js` and `web.html` repeat band counts/ranges, compensation and control constants. Keep validation on both sides of the HTTP boundary, but give parity cases one fixture source. Distinguish `eq_same()`'s audio-only 0.05 dB comparison from full settings equality and 0.002 dB readback verification in names and comments. Avoid generic helpers that hide these different meanings.
+- [ ] **P2 — Make EQ policy duplication and comparisons explicit.** `config.c`, `app.js` and `web.html` repeat band counts/ranges, compensation and control constants. Keep validation on both sides of the HTTP boundary, but give parity cases one fixture source. Distinguish `eq_same()`'s exact audio-only comparison from full settings equality and 0.002 dB readback verification in names and comments. Avoid generic helpers that hide these different meanings.
 - [ ] **P2 — Break large test scenarios into named cases.** `tests/library.c`, `tests/browser.c` and `tests/integration.sh` contain long ordered flows. Extract reusable fixtures and named scenario functions so failures identify the transition under test; retain explicit sequencing where the test verifies persistence, routing or restart history. Keep existing assertions and Fourier/latency thresholds.
 
 ## Missing code documentation
@@ -40,9 +40,10 @@ The user guide is detailed, but most public declarations and browser state trans
 - [x] Maintain loudness when loading (default on)
 - [x] Copy values as JSONL
 - [x] Autoload preset listbox with mouse-wheel load
-- [x] Auto-save an `(Auto)` preset on an edited song transition with recall enabled
-- [x] Log observed song transitions and EQ to outputlog.txt when enabled (default on)
+- [x] Auto-save an `(Auto)` preset when an edited song ends with recall enabled
+- [x] Log each ended song’s final EQ to outputlog.txt when enabled (default on)
 - [x] Per-output song EQ memory and separate general device EQ
 - [x] Cross-device song fallback with a preferred saved device
 - [x] Per-output master volume/mute recall and external mixer observation
 - [x] Automatic playback routing when EQ is default and unambiguous Bluetooth recovery
+- [x] Saved output selection priority, cascading fallback and automatic return on reconnect

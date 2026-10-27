@@ -168,6 +168,8 @@ other_id=$(state | jq '.desktop.mixer[] | select(.kind == "output" and .name == 
 post mixer "$(jq -nc --arg token "$playback_token" --arg target "$other_token" '{token:$token,action:"move",target:$target}')"
 await_state "any(.desktop.mixer[]; .token == \"$playback_token\" and .route == $other_id)"
 kill "$stream" "$capture"; wait "$stream" || true; wait "$capture" || true; stream= capture=
+# Exercise exact saved-preamp recall with load compensation explicitly off.
+post library '{"action":"maintain_load","enabled":false}'
 build/test-player > "$temp/player.log" 2>&1 & player=$!
 await_state '.desktop.selected_player.title == "Song A" and .library.song_count == 0'
 put eq '{"gains":[4,0,0,0,0,0,0,0,0,0],"preamp":0}'
@@ -254,6 +256,7 @@ await_state '(.pending | not) and .persistence_error == ""'
 put output '{"name":"test.other"}'
 await_state '.settings.output == "test.other" and .live.connected and (.pending | not)'
 # Return to flat before browser keyboard checks.
+post library '{"action":"maintain_load","enabled":true}'
 put eq '{"gains":[0,0,0,0,0,0,0,0,0,0],"preamp":0}'
 await_state '(.pending | not) and .live.eq.gains[5] == 0'
 if command -v chromium >/dev/null && [[ -x build/browser ]]; then
@@ -312,8 +315,7 @@ state > "$temp/restarted.json"
 if [[ -x build/probe ]]; then measure restarted 0 -5.75; fi
 output_id=$(pw-dump | jq '.[] | select(.type == "PipeWire:Interface:Node" and .info.props["node.name"] == "test.output") | .id')
 pw-cli destroy "$output_id"
-await_state '(.live.output_present | not) and (.live.connected | not) and (.live.editing | not)'
-await_state '(.live.status | contains("Select your speakers or headphones")) and .output_error == "" and .live.can_select_output'
+await_state '.live.connected and .settings.output == "test.other" and (.pending | not)'
 put output '{"name":"test.other"}'
 await_state '.live.connected and (.pending | not)'
 echo 'Integration: readback, coalescing, stable sink, output switching, default sink, restart and output removal passed.'
@@ -358,7 +360,7 @@ eq_node=$(state | jq '.live.sink_id')
 old_node=$(pw-dump | jq '.[] | select(.type == "PipeWire:Interface:Node" and .info.props["node.name"] == "bluez_output.AA_BB_CC_DD_EE_01.1") | .id')
 pw-cli destroy "$old_node"
 mock_output bluez_output.AA:BB:CC:DD:EE:02
-await_state '(.live.output_present | not) and .settings.output == "bluez_output.AA_BB_CC_DD_EE_01.1"'
+await_state '.live.connected and .settings.output == "test.other" and (.pending | not)'
 mock_output bluez_output.AA:BB:CC:DD:EE:01
 await_state ".live.connected and .settings.output == \"bluez_output.AA:BB:CC:DD:EE:01\" and (.pending | not) and .live.sink_id == $eq_node"
 jq -e '.output == "bluez_output.AA:BB:CC:DD:EE:01"' "$XDG_STATE_HOME/eqweb/settings-v1.json" >/dev/null
@@ -369,8 +371,43 @@ mock_output bluez_output.AA_BB_CC_DD_EE_01.2
 start_editor
 await_state 'any(.outputs[]; .name == "bluez_output.AA_BB_CC_DD_EE_01.2") and any(.outputs[]; .name == "bluez_output.AA:BB:CC:DD:EE:01")'
 sleep 1
-await_state '(.live.output_present | not) and .settings.output == "bluez_output.AA_BB_CC_DD_EE_01.9"'
+await_state '.live.connected and .settings.output == "test.other" and (.pending | not)'
 ambiguous_node=$(pw-dump | jq '.[] | select(.type == "PipeWire:Interface:Node" and .info.props["node.name"] == "bluez_output.AA_BB_CC_DD_EE_01.2") | .id')
 pw-cli destroy "$ambiguous_node"
 await_state ".live.connected and .settings.output == \"bluez_output.AA:BB:CC:DD:EE:01\" and (.pending | not) and .live.sink_id == $eq_node"
 echo 'Automation: Bluetooth name changes, unrelated/ambiguous device exclusion, persistence and legacy startup recovery passed.'
+
+# Selection history survives fallback and editor restart. Reselecting promotes a device.
+mock_output test.third
+await_state 'any(.outputs[]; .name == "test.third")'
+put output '{"name":"test.third"}'
+await_state '.live.connected and .settings.output == "test.third"'
+put output '{"name":"bluez_output.AA:BB:CC:DD:EE:01"}'
+await_state '.live.connected and .settings.output == "bluez_output.AA:BB:CC:DD:EE:01" and (.library.pending | not)'
+remove_output() {
+  local node
+  node=$(pw-dump | jq --arg name "$1" '.[] | select(.type == "PipeWire:Interface:Node" and .info.props["node.name"] == $name) | .id')
+  pw-cli destroy "$node"
+}
+remove_output bluez_output.AA:BB:CC:DD:EE:01
+await_state '.live.connected and .settings.output == "test.third" and (.pending | not)'
+remove_output test.third
+await_state '.live.connected and .settings.output == "test.other" and (.pending | not)'
+remove_output test.other
+await_state '(.live.output_present | not) and (.live.editing | not) and .settings.output == "test.other"'
+# Unselected Bluetooth 02 remains available but must not be adopted.
+kill "$editor"; wait "$editor"; editor=
+start_editor
+await_state '(.live.output_present | not) and .settings.output == "test.other"'
+mock_output test.third
+await_state '.live.connected and .settings.output == "test.third"'
+mock_output bluez_output.AA_BB_CC_DD_EE_01.3
+await_state '.live.connected and .settings.output == "bluez_output.AA_BB_CC_DD_EE_01.3"'
+put output '{"name":"test.third"}'
+await_state '.live.connected and .settings.output == "test.third" and .library.output_priority[0] == "test.third" and (.library.pending | not)'
+kill "$editor"; wait "$editor"; editor=
+start_editor
+await_state '.live.connected and .settings.output == "test.third"'
+remove_output test.third
+await_state '.live.connected and .settings.output == "bluez_output.AA_BB_CC_DD_EE_01.3"'
+echo 'Output priority: cascading fallback, no selected outputs, reconnect, reselection and restart passed.'

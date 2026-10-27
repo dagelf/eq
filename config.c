@@ -57,8 +57,8 @@ void compensate(struct settings *s) {
     if (s->maintain) s->preamp=fmax(-24,fmin(12,s->loudness_target-average_gain(s)));
 }
 bool eq_same(const struct settings *a, const struct settings *b) {
-    if (fabs(a->preamp-b->preamp)>0.05) return false;
-    for (int i=0;i<BANDS;i++) if (fabs(a->gains[i]-b->gains[i])>0.05) return false;
+    if (a->preamp!=b->preamp) return false;
+    for (int i=0;i<BANDS;i++) if (a->gains[i]!=b->gains[i]) return false;
     return true;
 }
 bool parse_eq(struct json_object *o, struct settings *s) {
