@@ -78,7 +78,7 @@ The 2026-09-11 editor executable was about 329 KiB with debug information. That 
 | Idle, no browser, 5.011 seconds | 0.5986% | 15,140 KiB |
 | Playback active, no browser, 5.011 seconds | 0.7983% | 15,380 KiB |
 
-CPU samples use `/proc/PID/stat` deltas at the host's scheduler tick resolution. These short samples include polling the mixer and test media player. The control timer runs at 20 Hz, so idle cost is small but nonzero. Browser resource usage is excluded.
+CPU samples use `/proc/PID/stat` deltas at the host's scheduler tick resolution. Those historical samples include the former mixer/player polling and 20 Hz control timer. The event-driven implementation below replaces those loops. Browser resource usage is excluded.
 
 Two noninitial `pw-top` snapshots during playback showed EQ input-node busy times of 10.0–11.5 µs and output-node busy times of 71.4–74.0 µs per 5.333 ms quantum; reported error counters were zero. These include PipeWire node work and are observations, not an isolated DSP benchmark or a guarantee against underruns under other loads. There is no claim of zero CPU, zero latency or zero allocation cost.
 
@@ -87,3 +87,21 @@ Two noninitial `pw-top` snapshots during playback showed EQ input-node busy time
 Physical ALSA/Bluetooth playback and real hardware hotplug were not exercised. Output removal used destruction of a synthetic sink. Tests demonstrate routing policy, signal processing and software timing in isolation; actual device buffering and session-manager policy may differ. The editor does not alter system quantum/rate. While EQ is default and connected for editing, it automatically routes eligible application streams from the selected output through EQ, checking once per stream/default selection and respecting later manual moves. Mixer controls also allow explicit routing. Media integration was tested with a synthetic MPRIS player; metadata quality and supported actions vary by player. Gain compensation uses the arithmetic mean of band gains and does not measure perceptual loudness.
 
 PipeWire 1.6.8's idle filter-graph controls may retain stale parameter readback until activation. That case is handled and tested as “saved; waiting for playback to confirm,” with live readback verified once processing begins.
+
+
+## Event-driven idle operation — 2026-10-27
+
+The controller now uses notifications and one-shot deadlines. The desktop worker uses PulseAudio subscriptions and MPRIS signals. HTTP state responses reuse cached JSON, and visible browsers wait for changes using conditional requests rather than polling. Hidden pages cancel state requests and the playback display clock. Connection failures stop after four attempts and socket changes restart recovery. Pending-save retries and the 30-second lifetime of waiting HTTP requests remain explicit deadlines.
+
+Isolated run: `/tmp/eqweb-integration-HyWRMS`.
+
+| Sample | Editor CPU, one core | Editor RSS |
+| --- | ---: | ---: |
+| Idle, no browser, 5.010 seconds | 0.0000% | 16,048 KiB |
+| Playback active, no browser, 5.011 seconds | 0.0000% | 16,216 KiB |
+
+Both observations recorded zero CPU ticks at the host's `/proc/PID/stat` resolution. They do not imply that commands, state changes or PipeWire DSP take no CPU. Audio gain, stereo isolation and editor-closed processing retain the expected results above.
+
+Regression checks cover idle wakeups after connection attempts stop, conditional state notifications without blocking ordinary requests, external player changes via D-Bus, PulseAudio reconnect token replacement, PipeWire recovery after retry exhaustion, and absence of repeated browser requests while settled or hidden. Existing persistence, routing, output recall, browser controls and signal-processing checks remain in the suite.
+
+The deployed desktop process (PID 2462938) recorded **zero CPU ticks over 10.002 seconds** after settling with the host audio services still failed. Its controller, desktop worker, D-Bus and HTTP threads recorded zero voluntary wakeups during that interval; GLib's filesystem-monitor thread recorded 15. The serving process and embedded JavaScript were checked through port 8932. A focused private-session-bus test additionally verified player appearance, external playback-state changes and disappearance with the namespace-filtered subscription.

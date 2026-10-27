@@ -231,6 +231,19 @@ $('player-progress').addEventListener('click', event => {
   action('/api/player', {player: player.id, action: 'seek', position: fraction * player.length});
 });
 const duration = seconds => `${Math.floor(Math.max(0,seconds || 0)/60)}:${String(Math.floor(Math.max(0,seconds || 0)%60)).padStart(2,'0')}`;
+// The player owns position/status. Only the visible playback clock advances
+// between observations; no requests or business-state mutations occur here.
+function updateProgress() {
+  clearTimeout(playerClock);
+  const player = latest?.desktop.selected_player || {};
+  const elapsed = player.status === 'Playing' && player.observed_at ? Math.max(0,Date.now()/1000-player.observed_at) : 0;
+  const position = Math.min((player.position || 0) + elapsed, player.length || Infinity);
+  $('player-progress').max = player.length || 1;
+  $('player-progress').value = Math.min(position,player.length || 1);
+  $('player-time').textContent = player.id ? `${duration(position)} / ${duration(player.length)}` : '';
+  if (!document.hidden && player.status === 'Playing' && position < (player.length || Infinity))
+    playerClock = setTimeout(updateProgress,1000);
+}
 function updatePlayer(desktop, library) {
   const signature = JSON.stringify([(desktop.players || []).map(p => [p.id,p.name]), library.player]);
   if (signature !== playerSignature) {
@@ -250,8 +263,7 @@ function updatePlayer(desktop, library) {
   const canSeek = !!(player.id && player.CanControl && player.CanSeek);
   $('player-progress').disabled = !seekable;
   $('player-progress').setAttribute('aria-label', seekable ? 'Track progress; click to seek' : 'Track progress');
-  $('player-progress').max = player.length || 1; $('player-progress').value = Math.min(player.position || 0,player.length || 1);
-  $('player-time').textContent = player.id ? `${duration(player.position)} / ${duration(player.length)}` : '';
+  updateProgress();
   $('seek-back').disabled = $('seek-forward').disabled = !canSeek;
   $('remember-song').checked = library.remember;
   $('ignore-custom').checked = library.ignore_custom;
@@ -275,6 +287,8 @@ function updatePlayer(desktop, library) {
 }
 function sendMixer(token, actionName, value) {
   mixerHold.set(token,Date.now()+1800);
+  clearTimeout(holdTimer);
+  holdTimer = setTimeout(() => { if (latest && !document.hidden) updateMixer(latest.desktop); },1850);
   const body = {token,action:actionName,...(actionName === 'move' ? {target:value} : {value})};
   if (latest?.desktop.mixer.some(item => item.token === token && item.name === 'effect_input.eqweb')) body.output = latest.settings.output;
   const key = `${token}:${actionName}`;
@@ -360,13 +374,9 @@ $('master-mute').addEventListener('click', () => {
   if (!master) return;
   const value = $('master-mute').getAttribute('aria-pressed') !== 'true'; $('master-mute').setAttribute('aria-pressed',String(value)); sendMixer(master.token,'mute',value);
 });
-let polling = false;
-async function poll() {
-  if (polling) return;
-  polling = true;
-  try {
-    const response = await fetch('/api/state'); if (!response.ok) throw Error(`HTTP ${response.status}`);
-    const state = await response.json(); latest = state;
+let polling = false, stateTag = '', stateRequest, stateRetry, playerClock, holdTimer;
+function renderState(state) {
+  latest = state;
     if (instance !== state.instance) { instance = state.instance; acceptedRevision = 0; masterEpoch = 0; mixerHold.clear(); }
     $('status').textContent = state.live.status;
     editing = state.live.editing; $('editor').disabled = !editing; $('preset-load').disabled = $('autoload').disabled = !editing;
@@ -415,16 +425,46 @@ async function poll() {
     $('saved').textContent = state.setup_required ? 'Stop the editor and run ./eqweb setup to choose your audio output, then restart PipeWire once.' :
       dirty || sending || state.pending || state.library.pending || state.revision < acceptedRevision ? 'Applying and saving…' :
       state.persistence_error ? 'Settings have not been fully saved.' : state.apply_error ? 'Saved; live apply needs attention.' : state.live.awaiting_readback ? 'Settings saved; waiting for playback to confirm live values.' : 'Settings saved.';
+}
+async function poll(wait = false) {
+  if (polling) { if (latest) renderState(latest); return; }
+  if (document.hidden) return;
+  clearTimeout(stateRetry);
+  polling = true;
+  const request = new AbortController(); stateRequest = request;
+  let retry = 0;
+  try {
+    const response = await fetch(wait && stateTag ? '/api/state?wait=1' : '/api/state', {
+      signal: request.signal, headers: wait && stateTag ? {'If-None-Match': stateTag} : {}
+    });
+    if (response.status === 304) return;
+    if (!response.ok) throw Error(`HTTP ${response.status}`);
+    const state = await response.json();
+    if (request.signal.aborted) return;
+    stateTag = response.headers.get('ETag') || '';
+    renderState(state);
   } catch (error) {
+    if (request.signal.aborted) return;
+    retry = 2000;
     $('status').textContent = 'Editor disconnected'; $('errors').textContent = error.message; editing = false;
     $('editor').disabled = $('output').disabled = $('prefer-output').disabled = $('default').disabled = $('master-control').disabled = true;
     for (const id of ['previous','next','playpause','preset-load','seek-back','seek-forward','autoload','save-device-eq']) $(id).disabled = true;
     $('player-progress').disabled = true;
     for (const button of $('quickbar').querySelectorAll('[data-quickbar]')) button.disabled = true;
     for (const row of mixerRows.values()) row.range.disabled = row.number.disabled = row.mute.disabled = row.route.disabled = true;
-  } finally { polling = false; }
+  } finally {
+    polling = false; stateRequest = null;
+    if (!document.hidden) stateRetry = setTimeout(() => poll(true),retry);
+  }
 }
 window.addEventListener('pagehide', () => {
+  stateRequest?.abort(); clearTimeout(stateRetry); clearTimeout(playerClock);
   if (dirty) fetch('/api/eq', {method:'PUT',keepalive:true,headers:{'Content-Type':'application/json'},body:JSON.stringify({...eqCopy(),output:editOutput})}).catch(() => {});
 });
-displaySettings(); poll(); setInterval(poll,750);
+document.addEventListener('visibilitychange', () => {
+  clearTimeout(stateRetry); clearTimeout(playerClock);
+  if (document.hidden) stateRequest?.abort();
+  else { stateTag = ''; poll(); updateProgress(); }
+});
+window.addEventListener('pageshow', () => { stateTag = ''; poll(); });
+displaySettings(); poll();

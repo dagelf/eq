@@ -4,6 +4,7 @@
 #include "eq.h"
 #include <gio/gio.h>
 #include <pulse/pulseaudio.h>
+#include <pulse/glib-mainloop.h>
 #include <pthread.h>
 #include <stdbool.h>
 #include <math.h>
@@ -11,7 +12,7 @@
 #include <string.h>
 #include <unistd.h>
 
-/* Only the worker touches PulseAudio and D-Bus. HTTP and the realtime-control
+/* Only the worker touches PulseAudio and D-Bus. HTTP and the PipeWire control
  * loop exchange immutable JSON snapshots and bounded commands with it. */
 static struct {
     pthread_t thread;
@@ -19,7 +20,14 @@ static struct {
     bool stop, started;
     struct json_object *snapshot,*queue[32];
     unsigned queued, generation;
-    pa_mainloop *loop;
+    pa_glib_mainloop *loop;
+    GMainContext *context;
+    GFileMonitor *audio_monitor, *pulse_monitor;
+    void (*notify)(bool reconnect);
+    bool mixer_dirty, players_dirty;
+    unsigned pulse_attempts;
+    double retry_at;
+    guint bus_signals[3];
     pa_context *pulse;
     GDBusConnection *bus;
     struct json_object *mixer,*players;
@@ -34,29 +42,50 @@ static double stamp(void) { return g_get_monotonic_time()/1e6; }
 static void string(struct json_object *o,const char *key,const char *v) { json_object_object_add(o,key,json_object_new_string(v?v:"")); }
 static void boolean(struct json_object *o,const char *key,bool v) { json_object_object_add(o,key,json_object_new_boolean(v)); }
 static void number(struct json_object *o,const char *key,double v) { json_object_object_add(o,key,json_object_new_double(v)); }
+/* Nested iteration is limited to an in-flight operation with a real deadline.
+ * Notification callbacks only invalidate state; they never execute commands. */
+static gboolean deadline_expired(void *data) { *(bool *)data=true; return G_SOURCE_REMOVE; }
+static GSource *deadline(bool *expired) {
+    GSource *source=g_timeout_source_new(600);
+    g_source_set_callback(source,deadline_expired,expired,NULL);
+    g_source_attach(source,d.context); return source;
+}
 static bool pulse_wait(pa_operation *op) {
     if (!op) return false;
-    double end=stamp()+.6;
-    while (pa_operation_get_state(op)==PA_OPERATION_RUNNING && stamp()<end &&
-        pa_context_get_state(d.pulse)==PA_CONTEXT_READY) {
-        pa_mainloop_iterate(d.loop,0,NULL); usleep(1000);
-    }
+    bool expired=false; GSource *source=deadline(&expired);
+    while (pa_operation_get_state(op)==PA_OPERATION_RUNNING && !expired &&
+        pa_context_get_state(d.pulse)==PA_CONTEXT_READY) g_main_context_iteration(d.context,TRUE);
     bool ok=pa_operation_get_state(op)==PA_OPERATION_DONE;
+    g_source_destroy(source); g_source_unref(source);
     if (!ok) pa_operation_cancel(op);
     pa_operation_unref(op); return ok;
 }
+static void mixer_changed(pa_context *c,pa_subscription_event_type_t type,uint32_t id,void *data) {
+    (void)c; (void)type; (void)id; (void)data; d.mixer_dirty=true;
+}
+static void pulse_state(pa_context *c,void *data) {
+    (void)data;
+    if (pa_context_get_state(c)==PA_CONTEXT_FAILED || pa_context_get_state(c)==PA_CONTEXT_TERMINATED)
+        d.mixer_dirty=true;
+}
 static bool pulse_connect(void) {
     if (d.pulse && pa_context_get_state(d.pulse)==PA_CONTEXT_READY) return true;
-    if (d.pulse) { pa_context_disconnect(d.pulse); pa_context_unref(d.pulse); d.pulse=NULL; }
-    d.pulse=pa_context_new(pa_mainloop_get_api(d.loop),"EQ desktop controls");
+    if (d.pulse_attempts>=4 || stamp()<d.retry_at) return false;
+    d.retry_at=stamp()+(1u<<d.pulse_attempts++);
+    if (d.pulse) { pa_context_set_state_callback(d.pulse,NULL,NULL); pa_context_disconnect(d.pulse); pa_context_unref(d.pulse); d.pulse=NULL; }
+    d.pulse=pa_context_new(pa_glib_mainloop_get_api(d.loop),"EQ desktop controls");
     if (!d.pulse) return false;
+    pa_context_set_state_callback(d.pulse,pulse_state,NULL);
     if (pa_context_connect(d.pulse,NULL,PA_CONTEXT_NOAUTOSPAWN,NULL)<0) return false;
-    double end=stamp()+.6;
-    while (PA_CONTEXT_IS_GOOD(pa_context_get_state(d.pulse)) && pa_context_get_state(d.pulse)!=PA_CONTEXT_READY && stamp()<end) {
-        pa_mainloop_iterate(d.loop,0,NULL); usleep(1000);
-    }
-    d.generation++;
-    return pa_context_get_state(d.pulse)==PA_CONTEXT_READY;
+    bool expired=false; GSource *source=deadline(&expired);
+    while (PA_CONTEXT_IS_GOOD(pa_context_get_state(d.pulse)) && pa_context_get_state(d.pulse)!=PA_CONTEXT_READY && !expired)
+        g_main_context_iteration(d.context,TRUE);
+    g_source_destroy(source); g_source_unref(source);
+    if (pa_context_get_state(d.pulse)!=PA_CONTEXT_READY) return false;
+    d.generation++; d.pulse_attempts=0; d.retry_at=0;
+    pa_context_set_subscribe_callback(d.pulse,mixer_changed,NULL);
+    return pulse_wait(pa_context_subscribe(d.pulse,PA_SUBSCRIPTION_MASK_SINK|PA_SUBSCRIPTION_MASK_SOURCE|
+        PA_SUBSCRIPTION_MASK_SINK_INPUT|PA_SUBSCRIPTION_MASK_SOURCE_OUTPUT,NULL,NULL));
 }
 static void entry(struct json_object *items,const char *kind,uint32_t id,const char *name,const char *description,
     const pa_cvolume *volume,bool mute,bool writable,pa_proplist *props,uint32_t route) {
@@ -199,11 +228,35 @@ static GVariant *bus_call(const char *dest,const char *path,const char *iface,co
 static void variant_string(struct json_object *o,const char *key,GVariant *props,const char *name) {
     const char *s=""; g_variant_lookup(props,name,"&s",&s); string(o,key,s);
 }
+static void player_changed(GDBusConnection *bus,const gchar *sender,const gchar *path,
+    const gchar *iface,const gchar *signal,GVariant *args,gpointer data) {
+    (void)bus; (void)sender; (void)path; (void)iface; (void)data;
+    if (!strcmp(signal,"NameOwnerChanged")) {
+        const char *name; g_variant_get_child(args,0,"&s",&name);
+        if (!g_str_has_prefix(name,"org.mpris.MediaPlayer2.")) return;
+    }
+    d.players_dirty=true;
+}
+static void bus_closed(GDBusConnection *bus,gboolean vanished,GError *error,void *data) {
+    (void)bus; (void)vanished; (void)error; (void)data; d.players_dirty=true;
+}
 static void refresh_players(void) {
     struct json_object *players=json_object_new_array();
     GError *error=NULL;
     if (d.bus && g_dbus_connection_is_closed(d.bus)) { g_object_unref(d.bus); d.bus=NULL; }
-    if (!d.bus) d.bus=g_bus_get_sync(G_BUS_TYPE_SESSION,NULL,&error);
+    if (!d.bus) {
+        d.bus=g_bus_get_sync(G_BUS_TYPE_SESSION,NULL,&error);
+        if (d.bus) {
+            g_dbus_connection_set_exit_on_close(d.bus,FALSE);
+            g_signal_connect(d.bus,"closed",G_CALLBACK(bus_closed),NULL);
+            d.bus_signals[0]=g_dbus_connection_signal_subscribe(d.bus,"org.freedesktop.DBus","org.freedesktop.DBus",
+                "NameOwnerChanged","/org/freedesktop/DBus","org.mpris.MediaPlayer2",G_DBUS_SIGNAL_FLAGS_MATCH_ARG0_NAMESPACE,player_changed,NULL,NULL);
+            d.bus_signals[1]=g_dbus_connection_signal_subscribe(d.bus,NULL,"org.freedesktop.DBus.Properties",
+                "PropertiesChanged",PLAYER_PATH,PLAYER_IFACE,G_DBUS_SIGNAL_FLAGS_NONE,player_changed,NULL,NULL);
+            d.bus_signals[2]=g_dbus_connection_signal_subscribe(d.bus,NULL,PLAYER_IFACE,
+                "Seeked",PLAYER_PATH,NULL,G_DBUS_SIGNAL_FLAGS_NONE,player_changed,NULL,NULL);
+        }
+    }
     GVariant *names=d.bus?bus_call("org.freedesktop.DBus","/org/freedesktop/DBus","org.freedesktop.DBus","ListNames",NULL,&error):NULL;
     if (!names) {
         snprintf(d.player_error,sizeof(d.player_error),"Media players unavailable: %s",error?error->message:"no session bus");
@@ -221,7 +274,7 @@ static void refresh_players(void) {
         variant_string(p,"status",props,"PlaybackStatus");
         const char *caps[]={"CanControl","CanGoNext","CanGoPrevious","CanPlay","CanPause","CanSeek"};
         for (unsigned i=0;i<sizeof(caps)/sizeof(*caps);i++) { gboolean v=FALSE; g_variant_lookup(props,caps[i],"b",&v); boolean(p,caps[i],v); }
-        gint64 position=0; g_variant_lookup(props,"Position","x",&position); number(p,"position",position/1e6);
+        gint64 position=0; g_variant_lookup(props,"Position","x",&position); number(p,"position",position/1e6); number(p,"observed_at",g_get_real_time()/1e6);
         GVariant *metadata=g_variant_lookup_value(props,"Metadata",G_VARIANT_TYPE("a{sv}"));
         if (metadata) {
             variant_string(p,"title",metadata,"xesam:title"); variant_string(p,"album",metadata,"xesam:album");
@@ -279,55 +332,99 @@ static void publish(void) {
     pthread_mutex_lock(&d.mutex);
     if (d.snapshot) json_object_put(d.snapshot);
     d.snapshot=o; pthread_mutex_unlock(&d.mutex);
+    d.notify(false);
+}
+static void socket_changed(GFileMonitor *monitor,GFile *file,GFile *other,GFileMonitorEvent event,void *data) {
+    (void)file; (void)other; (void)data;
+    if (event!=G_FILE_MONITOR_EVENT_CREATED && event!=G_FILE_MONITOR_EVENT_DELETED &&
+        event!=G_FILE_MONITOR_EVENT_MOVED_IN && event!=G_FILE_MONITOR_EVENT_MOVED_OUT) return;
+    /* pipewire-pulse may keep its socket while its PipeWire connection is down. */
+    d.pulse_attempts=0; d.retry_at=0; d.mixer_dirty=true;
+    if (monitor==d.audio_monitor) d.notify(true);
+}
+static GFileMonitor *watch_socket(const char *path) {
+    GFile *file=g_vfs_get_file_for_path(g_vfs_get_local(),path);
+    GFileMonitor *monitor=g_file_monitor_file(file,G_FILE_MONITOR_NONE,NULL,NULL);
+    g_object_unref(file);
+    if (monitor) g_signal_connect(monitor,"changed",G_CALLBACK(socket_changed),NULL);
+    return monitor;
 }
 static void *worker(void *unused) {
     (void)unused;
-    d.loop=pa_mainloop_new(); d.mixer=json_object_new_array(); d.players=json_object_new_array();
-    double refresh=0;
+    g_main_context_push_thread_default(d.context);
+    d.loop=pa_glib_mainloop_new(d.context); d.mixer=json_object_new_array(); d.players=json_object_new_array();
+    const char *runtime=getenv("PIPEWIRE_RUNTIME_DIR");
+    if (!runtime || !*runtime) runtime=getenv("XDG_RUNTIME_DIR");
+    const char *remote=getenv("PIPEWIRE_REMOTE"); if (!remote || !*remote) remote="pipewire-0";
+    char path[4096];
+    if (*remote=='/') d.audio_monitor=watch_socket(remote);
+    else if (runtime) { snprintf(path,sizeof(path),"%s/%s",runtime,remote); d.audio_monitor=watch_socket(path); }
+    const char *server=getenv("PULSE_SERVER"); runtime=getenv("XDG_RUNTIME_DIR");
+    if (server && g_str_has_prefix(server,"unix:")) d.pulse_monitor=watch_socket(server+5);
+    else if (runtime) { snprintf(path,sizeof(path),"%s/pulse/native",runtime); d.pulse_monitor=watch_socket(path); }
+    d.mixer_dirty=d.players_dirty=true;
     for (;;) {
+        while (g_main_context_pending(d.context)) g_main_context_iteration(d.context,FALSE);
         pthread_mutex_lock(&d.mutex);
         bool stop=d.stop;
         struct json_object *command=d.queued?d.queue[0]:NULL;
         if (command) { d.queued--; memmove(d.queue,d.queue+1,d.queued*sizeof(*d.queue)); }
         pthread_mutex_unlock(&d.mutex);
-        if (stop && !command) {
-            if (d.loop) { refresh_mixer(); sync_master(); }
-            publish(); break;
-        }
-        bool update=command || stamp()>=refresh;
-        if (update && d.loop) { refresh_mixer(); sync_master(); }
+        bool update=command || d.mixer_dirty || d.players_dirty;
+        if (d.mixer_dirty) { d.mixer_dirty=false; refresh_mixer(); sync_master(); }
         if (command) {
             const char *kind=json_string(command,"kind");
             if (!strcmp(kind,"output")) {
                 snprintf(d.output,sizeof(d.output),"%s",json_string(command,"name"));
                 d.output_epoch=json_object_get_int64(json_get(command,"epoch")); d.master_ready=false;
+                sync_master();
             } else if (!strcmp(kind,"mixer")) {
                 struct json_object *item=find_token(json_string(command,"token"));
                 if (item && item==master_item() && !d.master_ready) snprintf(d.action_error,sizeof(d.action_error),"EQ master volume is not ready; try again");
                 else mixer_action(command);
-            } else player_action(command);
+                refresh_mixer(); sync_master();
+            } else { player_action(command); d.players_dirty=true; }
             json_object_put(command);
-            if (d.loop) { refresh_mixer(); sync_master(); }
         }
-        if (update) { refresh_players(); publish(); refresh=stamp()+.75; }
-        if (d.loop) pa_mainloop_iterate(d.loop,0,NULL);
-        usleep(20000);
+        if (d.players_dirty) { d.players_dirty=false; refresh_players(); }
+        if (update || stop) publish();
+        if (stop && !command) break;
+        if (command || d.mixer_dirty || d.players_dirty) continue;
+        /* Queue checks and wakeups share the context's persistent wakeup fd. */
+        pthread_mutex_lock(&d.mutex); bool pending=d.queued || d.stop; pthread_mutex_unlock(&d.mutex);
+        if (pending) continue;
+        GSource *retry=NULL; bool expired=false;
+        if (d.pulse_attempts>0 && d.pulse_attempts<4) {
+            retry=g_timeout_source_new((guint)fmax(1,ceil((d.retry_at-stamp())*1000)));
+            g_source_set_callback(retry,deadline_expired,&expired,NULL); g_source_attach(retry,d.context);
+        }
+        g_main_context_iteration(d.context,TRUE);
+        if (retry) { g_source_destroy(retry); g_source_unref(retry); }
+        if (expired) d.mixer_dirty=true;
     }
-    if (d.pulse) { pa_context_disconnect(d.pulse); pa_context_unref(d.pulse); }
-    if (d.loop) pa_mainloop_free(d.loop);
-    if (d.bus) g_object_unref(d.bus);
+    if (d.audio_monitor) g_object_unref(d.audio_monitor);
+    if (d.pulse_monitor) g_object_unref(d.pulse_monitor);
+    if (d.pulse) { pa_context_set_state_callback(d.pulse,NULL,NULL); pa_context_disconnect(d.pulse); pa_context_unref(d.pulse); }
+    if (d.loop) pa_glib_mainloop_free(d.loop);
+    if (d.bus) {
+        for (unsigned i=0;i<3;i++) g_dbus_connection_signal_unsubscribe(d.bus,d.bus_signals[i]);
+        g_signal_handlers_disconnect_by_func(d.bus,bus_closed,NULL); g_object_unref(d.bus);
+    }
+    g_main_context_pop_thread_default(d.context);
     json_object_put(d.mixer); json_object_put(d.players); return NULL;
 }
-int desktop_start(struct json_object *output_volumes) {
+int desktop_start(struct json_object *output_volumes,void (*notify)(bool reconnect)) {
+    d.notify=notify; d.context=g_main_context_new();
     d.output_volumes=output_volumes?json_copy(output_volumes):json_object_new_object();
     int r=pthread_create(&d.thread,NULL,worker,NULL); d.started=r==0;
-    if (r) { json_object_put(d.output_volumes); d.output_volumes=NULL; }
+    if (r) { json_object_put(d.output_volumes); d.output_volumes=NULL; g_main_context_unref(d.context); }
     return r;
 }
 struct json_object *desktop_stop(void) {
     if (!d.started) return NULL;
     pthread_mutex_lock(&d.mutex); d.stop=true; pthread_mutex_unlock(&d.mutex);
-    pthread_join(d.thread,NULL);
+    g_main_context_wakeup(d.context);
+    pthread_join(d.thread,NULL); g_main_context_unref(d.context);
     for (unsigned i=0;i<d.queued;i++) json_object_put(d.queue[i]);
     if (d.snapshot) json_object_put(d.snapshot);
     struct json_object *volumes=d.output_volumes; d.output_volumes=NULL; return volumes;
@@ -340,6 +437,7 @@ const char *desktop_select_output(const char *output,unsigned *epoch) {
     *epoch=++d.next_output_epoch;
     json_object_object_add(command,"epoch",json_object_new_int64(*epoch));
     d.queue[d.queued++]=command;
+    g_main_context_wakeup(d.context);
     pthread_mutex_unlock(&d.mutex); return NULL;
 }
 struct json_object *desktop_snapshot(void) {
@@ -378,12 +476,14 @@ const char *desktop_action(const char *kind,struct json_object *body) {
             if (!strcmp(json_string(d.queue[i],"kind"),"mixer") && !strcmp(json_string(d.queue[i],"action"),"volume") &&
                 !strcmp(json_string(d.queue[i],"token"),json_object_get_string(token))) {
                 json_object_object_add(d.queue[i],"value",json_object_new_double(json_object_get_double(v)));
-                pthread_mutex_unlock(&d.mutex); return NULL;
+                g_main_context_wakeup(d.context);
+    pthread_mutex_unlock(&d.mutex); return NULL;
             }
         }
     }
     if (d.queued>=32 || !d.started || d.stop) { pthread_mutex_unlock(&d.mutex); return "Desktop controls are busy; try again"; }
     struct json_object *copy=json_copy(body);
     string(copy,"kind",kind); d.queue[d.queued++]=copy;
+    g_main_context_wakeup(d.context);
     pthread_mutex_unlock(&d.mutex); return NULL;
 }

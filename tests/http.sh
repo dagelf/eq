@@ -47,6 +47,29 @@ check 400 -X POST -H 'Content-Type: application/json' -d '{"action":"device_eq",
 head -c 4097 /dev/zero > "$temp/large"
 check 413 -X PUT -H 'Content-Type: application/json' --data-binary "@$temp/large" http://127.0.0.1:$EQWEB_PORT/api/eq
 if ./eqweb setup --output test.output > "$temp/lock.log" 2>&1; then echo 'Setup bypassed process lock'; exit 1; fi
+# A settled, disconnected editor must stop reconnecting and stop waking.
+for ((i=0;i<200;i++)); do
+  curl -fsS "http://127.0.0.1:$EQWEB_PORT/api/state" > "$temp/idle.json"
+  if jq -e '.live.status == "PipeWire unavailable; waiting for audio service" and (.library.pending|not)' "$temp/idle.json" >/dev/null; then break; fi
+  sleep .05
+done
+jq -e '.live.status == "PipeWire unavailable; waiting for audio service" and (.library.pending|not)' "$temp/idle.json" >/dev/null
+switches() { awk '/^voluntary_ctxt_switches:/ {sum+=$2} END {print sum}' /proc/"$pid"/task/*/status; }
+before=$(switches)
+sleep 2
+after=$(switches)
+if ((after-before>5)); then echo "Idle editor woke $((after-before)) times in 2 seconds"; exit 1; fi
+# Conditional state requests sleep until a change, without blocking other HTTP work.
+curl -fsS -D "$temp/headers" "http://127.0.0.1:$EQWEB_PORT/api/state" > /dev/null
+tag=$(awk 'tolower($1)=="etag:" {gsub("\r", "", $2); print $2}' "$temp/headers")
+[[ -n "$tag" ]]
+check 304 -H "If-None-Match: $tag" "http://127.0.0.1:$EQWEB_PORT/api/state"
+curl -fsS --max-time 5 -H "If-None-Match: $tag" "http://127.0.0.1:$EQWEB_PORT/api/state?wait=1" > "$temp/event.json" & subscriber=$!
+check 200 "http://127.0.0.1:$EQWEB_PORT/api/state"
+check 202 -X POST -H 'Content-Type: application/json' -d '{"action":"remember","enabled":false}' "http://127.0.0.1:$EQWEB_PORT/api/library"
+wait "$subscriber"
+jq -e '.library.remember == false' "$temp/event.json" >/dev/null
+echo "Idle: $((after-before)) wakeups in 2 seconds; conditional state notification passed."
 kill "$pid"; wait "$pid"; pid=
 if ./eqweb setup < /dev/null > "$temp/discovery.log" 2>&1; then echo 'Setup succeeded without PipeWire'; exit 1; fi
 rg -q 'Cannot connect to PipeWire' "$temp/discovery.log"

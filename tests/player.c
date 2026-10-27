@@ -51,6 +51,15 @@ static void method(GDBusConnection *c,const char *sender,const char *path,const 
         }
         position=us;
     }
+    GVariantBuilder changed, invalidated;
+    g_variant_builder_init(&changed,G_VARIANT_TYPE("a{sv}"));
+    g_variant_builder_init(&invalidated,G_VARIANT_TYPE("as"));
+    g_variant_builder_add(&changed,"{sv}","PlaybackStatus",g_variant_new_string(playing?"Playing":"Paused"));
+    g_variant_builder_add(&changed,"{sv}","Metadata",property(c,sender,path,iface,"Metadata",NULL,NULL));
+    g_dbus_connection_emit_signal(c,NULL,path,"org.freedesktop.DBus.Properties","PropertiesChanged",
+        g_variant_new("(sa{sv}as)",iface,&changed,&invalidated),NULL);
+    if (!strcmp(name,"Seek") || !strcmp(name,"SetPosition"))
+        g_dbus_connection_emit_signal(c,NULL,path,iface,"Seeked",g_variant_new("(x)",(gint64)position),NULL);
     g_dbus_method_invocation_return_value(inv,NULL);
 }
 static const GDBusInterfaceVTable vtable={.method_call=method,.get_property=property};

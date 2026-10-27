@@ -1,7 +1,8 @@
 #ifndef DESKTOP_H
 #define DESKTOP_H
 #include <json-c/json.h>
-int desktop_start(struct json_object *output_volumes);
+#include <stdbool.h>
+int desktop_start(struct json_object *output_volumes,void (*notify)(bool reconnect));
 /* Stops the worker after accepted commands; caller owns the final volume map. */
 struct json_object *desktop_stop(void);
 const char *desktop_select_output(const char *output,unsigned *epoch);

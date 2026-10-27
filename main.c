@@ -42,6 +42,13 @@ struct object {
     enum pw_node_state node_state;
     enum pw_link_state link_state;
 };
+struct request {
+    size_t len; bool oversized, resumed;
+    char body[BODY_LIMIT+1];
+    struct MHD_Connection *connection;
+    struct request *next;
+    double deadline;
+};
 struct app {
     struct pw_main_loop *loop;
     struct pw_context *context;
@@ -49,7 +56,13 @@ struct app {
     struct pw_registry *registry;
     struct pw_metadata *metadata;
     struct spa_hook core_listener, registry_listener, metadata_listener;
-    struct spa_source *timer;
+    struct spa_source *timer, *wake;
+    double scheduled_at;
+    unsigned connect_attempts;
+    bool desktop_dirty, reconnect;
+    char *state_json, etag[128];
+    unsigned long state_version;
+    struct request *waiting;
     struct object *objects;
     uint32_t metadata_id;
     bool broken, need_apply, need_route, default_pending, installed, editing, pw_connected;
@@ -68,10 +81,45 @@ struct app {
     struct json_object *snapshot;
     struct json_object *desktop;
     struct library library;
-    double next_desktop;
+
 };
 static struct app app={.mutex=PTHREAD_MUTEX_INITIALIZER};
 static double now(void) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts); return ts.tv_sec+ts.tv_nsec/1e9; }
+static void wake(void) {
+    if (app.wake) pw_loop_signal_event(pw_main_loop_get_loop(app.loop),app.wake);
+}
+static void desktop_changed(bool reconnect) {
+    pthread_mutex_lock(&app.mutex);
+    app.desktop_dirty=true;
+    if (reconnect) app.reconnect=true;
+    wake(); pthread_mutex_unlock(&app.mutex);
+}
+/* One coalescing/deadline timer. Zero disarms it; idle has no timer. */
+static void arm(double at) {
+    struct timespec timeout={0};
+    if (at>0) {
+        double delay=fmax(.001,at-now());
+        timeout.tv_sec=(time_t)delay; timeout.tv_nsec=(long)((delay-timeout.tv_sec)*1e9);
+    }
+    app.scheduled_at=at;
+    pw_loop_update_timer(pw_main_loop_get_loop(app.loop),app.timer,&timeout,NULL,false);
+}
+static void changed(void *data,uint64_t count) {
+    (void)data; (void)count;
+    pthread_mutex_lock(&app.mutex);
+    double at=now()+.05;
+    if (!app.scheduled_at || at<app.scheduled_at) arm(at);
+    pthread_mutex_unlock(&app.mutex);
+}
+static void resume_waiters(bool all) {
+    double t=now();
+    for (struct request **p=&app.waiting;*p;) {
+        struct request *r=*p;
+        if (!all && t<r->deadline) { p=&r->next; continue; }
+        *p=r->next; r->next=NULL; r->resumed=true;
+        MHD_resume_connection(r->connection);
+    }
+}
 static const char *prop(const struct spa_dict *p,const char *key) { const char *v=p?spa_dict_lookup(p,key):NULL; return v?v:""; }
 static bool physical_output(const struct spa_dict *props,const char *name) {
     return !strcmp(prop(props,PW_KEY_MEDIA_CLASS),"Audio/Sink") &&
@@ -150,6 +198,7 @@ static bool readback_same(const struct settings *a,const struct settings *b) {
     return true;
 }
 static void node_info(void *data,const struct pw_node_info *info) {
+    wake();
     struct object *o=data;
     if (o->sink && info->state==PW_NODE_STATE_RUNNING && o->node_state!=PW_NODE_STATE_RUNNING && app.awaiting_readback) app.need_apply=true;
     o->node_state=info->state;
@@ -167,6 +216,7 @@ static void node_info(void *data,const struct pw_node_info *info) {
         pw_node_enum_params(o->proxy,++app.param_seq,SPA_PARAM_Props,0,UINT32_MAX,NULL);
 }
 static void node_param(void *data,int seq,uint32_t id,uint32_t index,uint32_t next,const struct spa_pod *param) {
+    wake();
     (void)data; (void)seq; (void)id; (void)index; (void)next;
     if (!param) return;
     const struct spa_pod_prop *p=spa_pod_find_prop(param,NULL,SPA_PROP_params);
@@ -195,11 +245,13 @@ static void node_param(void *data,int seq,uint32_t id,uint32_t index,uint32_t ne
 }
 static const struct pw_node_events node_events={PW_VERSION_NODE_EVENTS,.info=node_info,.param=node_param};
 static void link_info(void *data,const struct pw_link_info *info) {
+    wake();
     struct object *o=data; o->out_node=info->output_node_id; o->in_node=info->input_node_id;
     o->out_port=info->output_port_id; o->link_state=info->state;
 }
 static const struct pw_link_events link_events={PW_VERSION_LINK_EVENTS,.info=link_info};
 static int metadata_property(void *data,uint32_t subject,const char *key,const char *type,const char *value) {
+    wake();
     (void)data; (void)type;
     if (subject==PW_ID_CORE && (!key || !strcmp(key,"default.audio.sink"))) {
         bool was_default=!strcmp(app.default_name,SINK_NAME);
@@ -215,6 +267,7 @@ static int metadata_property(void *data,uint32_t subject,const char *key,const c
 }
 static const struct pw_metadata_events metadata_events={PW_VERSION_METADATA_EVENTS,.property=metadata_property};
 static void registry_global(void *data,uint32_t id,uint32_t permissions,const char *type,uint32_t version,const struct spa_dict *props) {
+    wake();
     (void)data; (void)permissions; (void)version;
     if (!strcmp(type,PW_TYPE_INTERFACE_Metadata) && !strcmp(prop(props,"metadata.name"),"default") && !app.metadata) {
         app.metadata=pw_registry_bind(app.registry,id,type,PW_VERSION_METADATA,0); app.metadata_id=id;
@@ -244,6 +297,7 @@ static void registry_global(void *data,uint32_t id,uint32_t permissions,const ch
     o->next=app.objects; app.objects=o;
 }
 static void registry_remove(void *data,uint32_t id) {
+    wake();
     (void)data;
     if (app.metadata && id==app.metadata_id) {
         spa_hook_remove(&app.metadata_listener); pw_proxy_destroy((struct pw_proxy *)app.metadata); app.metadata=NULL; app.default_name[0]=0;
@@ -259,11 +313,12 @@ static void registry_remove(void *data,uint32_t id) {
 }
 static const struct pw_registry_events registry_events={PW_VERSION_REGISTRY_EVENTS,.global=registry_global,.global_remove=registry_remove};
 static void core_error(void *data,uint32_t id,int seq,int res,const char *message) {
+    wake();
     (void)data; (void)seq;
     if (id==PW_ID_CORE && (res==-EPIPE || res==-ECONNRESET)) app.broken=true;
     snprintf(app.apply_error,sizeof(app.apply_error),"PipeWire: %s (%d)",message,res);
 }
-static void core_info(void *data,const struct pw_core_info *info) { (void)data; (void)info; app.pw_connected=true; }
+static void core_info(void *data,const struct pw_core_info *info) { (void)data; (void)info; app.pw_connected=true; app.connect_attempts=0; app.next_connect=0; wake(); }
 static void core_done(void *data,uint32_t id,int seq) {
     (void)data;
     if (app.stopping && id==PW_ID_CORE && seq==app.stop_seq) pw_main_loop_quit(app.loop);
@@ -277,7 +332,7 @@ static void disconnect_pw(void) {
     app.pw_connected=false; app.broken=false; app.readback=false; app.apply_deadline=0; app.output_deadline=0;
 }
 static void connect_pw(void) {
-    app.next_connect=now()+2;
+    app.next_connect=now()+(1u<<app.connect_attempts++);
     app.core=pw_context_connect(app.context,pw_properties_new(PW_KEY_APP_NAME,"EQ Web Editor",NULL),0);
     if (!app.core) return;
     pw_core_add_listener(app.core,&app.core_listener,&core_events,NULL);
@@ -362,7 +417,7 @@ static void snapshot(void) {
     if (app.readback) json_object_object_add(live,"eq",settings_json(&app.actual));
     bool output_missing=!output || !output->physical;
     if (output_missing) { app.output_error[0]=0; app.output_deadline=0; }
-    add_string(live,"status",!app.pw_connected?"PipeWire disconnected; reconnecting":!app.installed?"Setup required":!sink || !sink->graph?"Restart PipeWire once to load the new EQ graph":sink->node_state==PW_NODE_STATE_ERROR?"EQ is in an error state":!app.readback?"Waiting for EQ parameter readback":output_missing?"EQ output is unavailable. Select your speakers or headphones under Output below; no audio restart is needed. EQ editing is disabled until it reconnects.":wrong?"EQ is connected to a different output. Select the desired device under Output below.":link_error?"EQ could not connect to the selected output. Select an available device under Output below.":links<2?"EQ is not connected to the selected output for both audio channels. Select an available device under Output below; EQ editing is disabled until it reconnects.":"Connected");
+    add_string(live,"status",!app.pw_connected?app.connect_attempts<4?"PipeWire disconnected; reconnecting":"PipeWire unavailable; waiting for audio service":!app.installed?"Setup required":!sink || !sink->graph?"Restart PipeWire once to load the new EQ graph":sink->node_state==PW_NODE_STATE_ERROR?"EQ is in an error state":!app.readback?"Waiting for EQ parameter readback":output_missing?"EQ output is unavailable. Select your speakers or headphones under Output below; no audio restart is needed. EQ editing is disabled until it reconnects.":wrong?"EQ is connected to a different output. Select the desired device under Output below.":link_error?"EQ could not connect to the selected output. Select an available device under Output below.":links<2?"EQ is not connected to the selected output for both audio channels. Select an available device under Output below; EQ editing is disabled until it reconnects.":"Connected");
     json_object_object_add(o,"live",live);
     add_bool(o,"setup_required",!app.installed);
     add_bool(o,"pending",app.persist_pending || app.eq_pending || app.output_pending || app.default_pending || app.apply_deadline>0 || app.default_deadline>0 || app.output_deadline>0);
@@ -372,21 +427,28 @@ static void snapshot(void) {
     add_string(o,"persistence_error",app.persist_error); add_string(o,"apply_error",app.apply_error); add_string(o,"output_error",app.output_error); add_string(o,"default_error",app.default_error);
     if (app.snapshot) json_object_put(app.snapshot);
     app.snapshot=o;
+    const char *json=json_object_to_json_string(o);
+    if (!app.state_json || strcmp(app.state_json,json)) {
+        free(app.state_json); app.state_json=strdup(json);
+        snprintf(app.etag,sizeof(app.etag),"\"%s-%lu\"",app.instance,++app.state_version);
+        resume_waiters(true);
+    }
 }
 static void tick(void *data,uint64_t expirations) {
     (void)data; (void)expirations; pthread_mutex_lock(&app.mutex);
-    double t=now();
+    double t=now(); app.scheduled_at=0;
+    if (app.reconnect) { app.connect_attempts=0; app.next_connect=0; app.reconnect=false; }
     if (app.broken) disconnect_pw();
-    if (!app.core && t>=app.next_connect) connect_pw();
+    if (!app.core && app.connect_attempts<4 && t>=app.next_connect) connect_pw();
     recover_output();
-    if (t>=app.next_desktop) {
+    if (app.desktop_dirty) {
+        app.desktop_dirty=false;
         if (app.desktop) json_object_put(app.desktop);
         app.desktop=desktop_snapshot();
         library_volumes(&app.library,json_get(app.desktop,"output_volumes"));
         if (library_follow(&app.library,app.desktop,&app.desired,app.editing)) {
             app.revision++; app.changed_at=t; app.persist_pending=true; app.eq_pending=true;
         }
-        app.next_desktop=t+.5;
     }
     library_flush(&app.library,t);
     struct object *sink=find_name(SINK_NAME),*play=find_name(PLAY_NAME);
@@ -422,19 +484,38 @@ static void tick(void *data,uint64_t expirations) {
         if (!app.core || t>app.stop_deadline) pw_main_loop_quit(app.loop);
         else if (!app.stop_seq) app.stop_seq=pw_core_sync(app.core,PW_ID_CORE,0);
     }
+    bool was_editing=app.editing;
     snapshot();
+    if (was_editing!=app.editing && app.desktop && library_follow(&app.library,app.desktop,&app.desired,app.editing)) {
+        app.revision++; app.changed_at=t; app.persist_pending=true; app.eq_pending=true; wake();
+    }
     if (!app.stopping) route_playback();
+    resume_waiters(app.stopping);
+    double due=0;
+#define DEADLINE(value) do { double v=(value); if (v>0 && (!due || v<due)) due=v; } while (0)
+    if (!app.core && app.connect_attempts<4) DEADLINE(app.next_connect);
+    if (app.persist_pending) DEADLINE(app.changed_at+.35);
+    if (app.library.dirty || (app.library.log_queue && json_object_array_length(app.library.log_queue)))
+        DEADLINE(fmax(app.library.retry_at,app.library.dirty?app.library.save_at:t+.001));
+    DEADLINE(app.apply_deadline); DEADLINE(app.output_deadline); DEADLINE(app.default_deadline);
+    if (app.stopping) DEADLINE(app.stop_deadline);
+    for (struct request *r=app.waiting;r;r=r->next) DEADLINE(r->deadline);
+#undef DEADLINE
+    arm(due);
     pthread_mutex_unlock(&app.mutex);
 }
-struct request { size_t len; bool oversized; char body[BODY_LIMIT+1]; };
-static enum MHD_Result reply(struct MHD_Connection *c,unsigned code,const char *body,const char *type) {
+static enum MHD_Result reply_tagged(struct MHD_Connection *c,unsigned code,const char *body,const char *type,const char *tag) {
     struct MHD_Response *r=MHD_create_response_from_buffer(strlen(body),(void *)body,MHD_RESPMEM_MUST_COPY);
     if (!r) return MHD_NO;
     MHD_add_response_header(r,"Content-Type",type);
     MHD_add_response_header(r,"Cache-Control","no-store");
+    if (tag) MHD_add_response_header(r,"ETag",tag);
     MHD_add_response_header(r,"X-Content-Type-Options","nosniff");
     MHD_add_response_header(r,"Content-Security-Policy","default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'");
     enum MHD_Result result=MHD_queue_response(c,code,r); MHD_destroy_response(r); return result;
+}
+static enum MHD_Result reply(struct MHD_Connection *c,unsigned code,const char *body,const char *type) {
+    return reply_tagged(c,code,body,type,NULL);
 }
 static enum MHD_Result error_reply(struct MHD_Connection *c,unsigned code,const char *msg) {
     struct json_object *o=json_object_new_object(); add_string(o,"error",msg);
@@ -466,7 +547,17 @@ static enum MHD_Result handle(void *cls,struct MHD_Connection *c,const char *url
         }
         if (strcmp(url,"/api/state")) return error_reply(c,404,"Not found");
         pthread_mutex_lock(&app.mutex);
-        enum MHD_Result result=reply(c,200,json_object_to_json_string(app.snapshot),"application/json");
+        const char *after=MHD_lookup_connection_value(c,MHD_HEADER_KIND,"If-None-Match");
+        const char *wait=MHD_lookup_connection_value(c,MHD_GET_ARGUMENT_KIND,"wait");
+        bool same=after && !strcmp(after,app.etag);
+        if (same && wait && !strcmp(wait,"1") && !r->resumed && !app.stopping) {
+            unsigned count=0; for (struct request *p=app.waiting;p;p=p->next) count++;
+            if (count>=8) { pthread_mutex_unlock(&app.mutex); return error_reply(c,429,"Too many waiting clients"); }
+            r->connection=c; r->deadline=now()+30; r->next=app.waiting; app.waiting=r;
+            MHD_suspend_connection(c); wake();
+            pthread_mutex_unlock(&app.mutex); return MHD_YES;
+        }
+        enum MHD_Result result=reply_tagged(c,same?304:200,same?"":app.state_json,"application/json",app.etag);
         pthread_mutex_unlock(&app.mutex); return result;
     }
     const char *origin=MHD_lookup_connection_value(c,MHD_HEADER_KIND,"Origin"),*site=MHD_lookup_connection_value(c,MHD_HEADER_KIND,"Sec-Fetch-Site");
@@ -526,6 +617,7 @@ static enum MHD_Result handle(void *cls,struct MHD_Connection *c,const char *url
         else app.default_pending=true;
     }
     if (!error && (eq || output)) { app.revision++; app.changed_at=now(); app.persist_pending=true; }
+    if (!error) wake();
     unsigned revision=app.revision;
     pthread_mutex_unlock(&app.mutex); json_object_put(body);
     if (error) return error_reply(c,code,error);
@@ -535,7 +627,7 @@ static enum MHD_Result handle(void *cls,struct MHD_Connection *c,const char *url
 static void completed(void *cls,struct MHD_Connection *c,void **context,enum MHD_RequestTerminationCode code) { (void)cls; (void)c; (void)code; free(*context); *context=NULL; }
 static void quit(void *data,int sig) {
     (void)data; (void)sig;
-    pthread_mutex_lock(&app.mutex); app.stopping=true; app.stop_deadline=now()+.5; pthread_mutex_unlock(&app.mutex);
+    pthread_mutex_lock(&app.mutex); app.stopping=true; app.stop_deadline=now()+.5; wake(); pthread_mutex_unlock(&app.mutex);
 }
 static int paths(void) {
     const char *home=getenv("HOME"),*state=getenv("XDG_STATE_HOME"),*config=getenv("XDG_CONFIG_HOME");
@@ -697,14 +789,14 @@ int main(int argc,char **argv) {
     pw_loop_add_signal(pw_main_loop_get_loop(app.loop),SIGTERM,quit,NULL);
     /* Workers inherit the signal mask installed by the PipeWire loop. */
     library_init_output(&app.library,&app.desired);
-    if (desktop_start(json_get(app.library.data,"output_volumes"))) { fputs("Cannot start desktop controls\n",stderr); close(lock); return 1; }
-    desktop_select_output(app.desired.output,&app.master_epoch);
     app.timer=pw_loop_add_timer(pw_main_loop_get_loop(app.loop),tick,NULL);
-    struct timespec interval={0,50000000};
-    pw_loop_update_timer(pw_main_loop_get_loop(app.loop),app.timer,&interval,&interval,false);
+    app.wake=pw_loop_add_event(pw_main_loop_get_loop(app.loop),changed,NULL);
+    if (desktop_start(json_get(app.library.data,"output_volumes"),desktop_changed)) { fputs("Cannot start desktop controls\n",stderr); close(lock); return 1; }
+    desktop_select_output(app.desired.output,&app.master_epoch);
+    app.desktop_dirty=true;
     tick(NULL,0);
     struct sockaddr_in addr={.sin_family=AF_INET,.sin_port=htons(listen_port),.sin_addr={htonl(INADDR_LOOPBACK)}};
-    struct MHD_Daemon *http=MHD_start_daemon(MHD_USE_INTERNAL_POLLING_THREAD,listen_port,NULL,NULL,handle,NULL,
+    struct MHD_Daemon *http=MHD_start_daemon(MHD_USE_INTERNAL_POLLING_THREAD|MHD_ALLOW_SUSPEND_RESUME,listen_port,NULL,NULL,handle,NULL,
         MHD_OPTION_SOCK_ADDR,&addr,MHD_OPTION_NOTIFY_COMPLETED,completed,NULL,
         MHD_OPTION_CONNECTION_LIMIT,(unsigned int)16,MHD_OPTION_CONNECTION_TIMEOUT,(unsigned int)5,
         MHD_OPTION_CONNECTION_MEMORY_LIMIT,(size_t)16384,MHD_OPTION_END);
@@ -715,13 +807,14 @@ int main(int argc,char **argv) {
     if (app.persist_pending) persist();
     bool failed=app.persist_pending;
     if (failed) fprintf(stderr,"Unsaved changes: %s\n",app.persist_error);
-    disconnect_pw(); pw_loop_destroy_source(pw_main_loop_get_loop(app.loop),app.timer);
-    pw_context_destroy(app.context); pw_main_loop_destroy(app.loop); pw_deinit();
     struct json_object *volumes=desktop_stop();
+    disconnect_pw(); pw_loop_destroy_source(pw_main_loop_get_loop(app.loop),app.timer);
+    pw_loop_destroy_source(pw_main_loop_get_loop(app.loop),app.wake); app.wake=NULL;
+    pw_context_destroy(app.context); pw_main_loop_destroy(app.loop); pw_deinit();
     library_volumes(&app.library,volumes); if (volumes) json_object_put(volumes);
     library_close(&app.library);
     if (*app.library.error) { fprintf(stderr,"%s\n",app.library.error); failed=true; }
     if (*app.library.log_error) { fprintf(stderr,"%s\n",app.library.log_error); failed=true; }
     if (app.desktop) json_object_put(app.desktop);
-    json_object_put(app.snapshot); close(lock); return failed?1:0;
+    free(app.state_json); json_object_put(app.snapshot); close(lock); return failed?1:0;
 }

@@ -1,5 +1,5 @@
 CC ?= cc
-PKGS = libpipewire-0.3 libmicrohttpd json-c libpulse gio-2.0
+PKGS = libpipewire-0.3 libmicrohttpd json-c libpulse libpulse-mainloop-glib gio-2.0
 CPPFLAGS += $(shell pkg-config --cflags $(PKGS)) -I.
 CFLAGS ?= -O2 -g
 CFLAGS += -std=gnu11 -Wall -Wextra -Werror

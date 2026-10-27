@@ -172,6 +172,12 @@ kill "$stream" "$capture"; wait "$stream" || true; wait "$capture" || true; stre
 post library '{"action":"maintain_load","enabled":false}'
 build/test-player > "$temp/player.log" 2>&1 & player=$!
 await_state '.desktop.selected_player.title == "Song A" and .library.song_count == 0'
+# External player changes must arrive through D-Bus signals, without an HTTP action.
+gdbus call --session --dest org.mpris.MediaPlayer2.eqweb_test --object-path /org/mpris/MediaPlayer2 --method org.mpris.MediaPlayer2.Player.PlayPause >/dev/null
+await_state '.desktop.selected_player.status == "Paused"'
+gdbus call --session --dest org.mpris.MediaPlayer2.eqweb_test --object-path /org/mpris/MediaPlayer2 --method org.mpris.MediaPlayer2.Player.PlayPause >/dev/null
+await_state '.desktop.selected_player.status == "Playing"'
+
 put eq '{"gains":[4,0,0,0,0,0,0,0,0,0],"preamp":0}'
 await_state '.settings.gains[0] == 4 and (.pending | not)'
 post player '{"player":"org.mpris.MediaPlayer2.eqweb_test","action":"next"}'
@@ -235,6 +241,16 @@ usage() {
   awk -v label="$label" '/VmRSS/ {print label " editor " $0}' "/proc/$editor/status" | tee -a "$temp/usage.txt"
 }
 usage idle
+# Pulse restart must refresh connection-scoped tokens and restore subscriptions.
+old_master=$(state | jq -r '.desktop.mixer[] | select(.name == "effect_input.eqweb") | .token')
+kill "$pulse"; wait "$pulse" || true; pulse=
+await_state '.desktop.mixer_error != ""'
+pipewire-pulse > "$temp/pulse-restarted.log" 2>&1 & pulse=$!
+await_state ".desktop.master_ready and .desktop.mixer_error == \"\" and any(.desktop.mixer[]; .name == \"effect_input.eqweb\" and .token != \"$old_master\")"
+pactl set-sink-volume effect_input.eqweb 87%
+await_state 'any(.desktop.mixer[]; .name == "effect_input.eqweb" and (.volume-87|fabs)<.01)'
+pactl set-sink-volume effect_input.eqweb 100%
+await_state 'any(.desktop.mixer[]; .name == "effect_input.eqweb" and .volume==100)'
 sink_id=$(state | jq .live.sink_id)
 put eq '{"gains":[0,0,0,0,0,6,0,0,0,0],"preamp":-3}'
 await_state '(.pending | not) and .apply_error == "" and .saved.gains[5] == 6'
@@ -309,6 +325,13 @@ fi
 kill "$wp"; wait "$wp" || true; wp=
 kill "$pw"; wait "$pw" || true; pw=
 await_state '(.live.pipewire | not) and (.live.editing | not)'
+# Exhaust reconnect attempts; socket creation must wake the sleeping editor.
+for ((i=0;i<200;i++)); do
+  state > "$temp/disconnected.json"
+  if jq -e '.live.status == "PipeWire unavailable; waiting for audio service"' "$temp/disconnected.json" >/dev/null; then break; fi
+  sleep .05
+done
+jq -e '.live.status == "PipeWire unavailable; waiting for audio service"' "$temp/disconnected.json" >/dev/null
 start_audio
 await_state '.live.connected and (.pending | not) and .apply_error == ""'
 state > "$temp/restarted.json"
